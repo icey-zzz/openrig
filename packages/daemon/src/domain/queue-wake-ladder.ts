@@ -63,7 +63,6 @@ import {
   LADDER_ATTEMPT_PREFIX,
   LADDER_RUNG_PREFIX,
   LADDER_EXHAUSTED_PREFIX,
-  defaultResolveOrchestrator,
   resolveSessionNodeId,
 } from "./queue-stuck-sweep.js";
 
@@ -475,13 +474,15 @@ function suspensionReason(db: Database.Database, destination: string, graceSecon
 /** Read the existing ladder's next eligible action; never create an intent,
  * reserve a retry, consume provider state or change its policy. The scheduler
  * still makes the final live-state decision at delivery time. */
-export function readWakeLadderBackstop(db: Database.Database, qitemId: string): WaitingView["nextBackstop"] | null {
+export function readWakeLadderBackstop(db: Database.Database, qitemId: string, acceptsDestination?: (destination: string) => boolean): WaitingView["nextBackstop"] | null {
   const row = db.prepare(`SELECT qitem_id AS qitemId, state, source_session AS sourceSession,
     destination_session AS destinationSession, claimed_at AS claimedAt, handed_off_from AS handedOffFrom,
     last_heartbeat AS lastHeartbeat, last_nudge_result AS lastNudgeResult,
-    last_nudge_attempt AS lastNudgeAttempt, ts_created AS tsCreated FROM queue_items WHERE qitem_id = ?`)
-    .get(qitemId) as Pick<QueueItem, "qitemId" | "state" | "sourceSession" | "destinationSession" | "claimedAt" | "handedOffFrom" | "lastHeartbeat" | "lastNudgeResult" | "lastNudgeAttempt" | "tsCreated"> | undefined;
+    last_nudge_attempt AS lastNudgeAttempt, ts_created AS tsCreated, tags AS tagsJson FROM queue_items WHERE qitem_id = ?`)
+    .get(qitemId) as Pick<QueueItem, "qitemId" | "state" | "sourceSession" | "destinationSession" | "claimedAt" | "handedOffFrom" | "lastHeartbeat" | "lastNudgeResult" | "lastNudgeAttempt" | "tsCreated"> & { tagsJson: string | null } | undefined;
   if (!row || !["pending", "in-progress"].includes(row.state)) return null;
+  const escalationOwner = () => JSON.parse(row.tagsJson ?? "[]").includes(ESCALATION_HOP_TAG)
+    ? null : resolveEscalationOwner(db, row.destinationSession, acceptsDestination).owner;
   const recovery = findWakeRecovery(db, qitemId);
   const disposition = recovery ? db.prepare("SELECT destination_session, tags FROM queue_items WHERE qitem_id = ?")
     .get(recovery.qitemId) as { destination_session: string; tags: string | null } : null;
@@ -500,7 +501,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string): 
   if (!eligible || !mode || (mode === "unconfirmed" && hasPickupEvidence(db, row))) return recovery ? recoveryBackstop() : null;
   const ladder = readLadder(db, qitemId);
   if (ladder.exhausted) return recovery ? recoveryBackstop() : {
-    owner: defaultResolveOrchestrator(db, row.destinationSession) ?? row.destinationSession,
+    owner: escalationOwner() ?? row.destinationSession,
     mechanism: "queue-wake-ladder:exhausted; queue-stuck-sweep:undelivered", dueAt: null, intervalSeconds: null,
     note: "No further ladder retry. Inspect the retained exhaustion and delivery evidence; the stuck sweep is the safety net.",
   };
@@ -524,7 +525,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string): 
   }
   const suspension = readSuspension(db, row.destinationSession, resolveWakeSwapGraceSeconds(), now);
   if (suspension) due = Math.max(due, Date.parse(suspension.until));
-  const orch = defaultResolveOrchestrator(db, row.destinationSession);
+  const orch = escalationOwner();
   const operator = ladder.orchRung || orch === null || orch === row.destinationSession;
   return {
     owner: retry ? row.destinationSession : operator ? resolveOperatorSeat() ?? row.sourceSession : orch!,
@@ -839,8 +840,10 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     for (const [dest, members] of escalating) {
       const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
       const orch = oneHop ? null : resolveOrch(dest);
+      const route = !deps.resolveOrchestrator
+        ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
       const routeReason = oneHop ? "escalates_to one-hop delivery already used; existing fallback retained"
-        : !deps.resolveOrchestrator ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)).reason : "";
+        : route && route.outcome !== "none" && route.outcome !== "parent" ? route.reason : "";
       for (const member of members) if (routeReason) member.reason += `; ${routeReason}`;
 
       // F3 — the aggregate refresh is detection-gated (the S02 idempotency shape): a
@@ -1170,9 +1173,11 @@ async function advancePromptRefusals(
     const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
     const orch = oneHop ? null : resolveOrch(dest);
     const toOperator = orch === null || orch === dest;
+    const route = !deps.resolveOrchestrator
+      ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
     const reason = "interactive prompt blocks outstanding work; no input was sent"
       + (oneHop ? "; escalates_to one-hop delivery already used; existing fallback retained"
-        : !deps.resolveOrchestrator ? `; ${resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)).reason}` : "");
+        : route && route.outcome !== "none" && route.outcome !== "parent" ? `; ${route.reason}` : "");
     const aggregate = await ensureEscalationRow(deps, dest,
       toOperator ? resolveOperatorSeat() ?? members[0]?.row.sourceSession ?? [...group.jobs.values()][0]! : orch!, members, reason,
       `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...group.keys], group.jobs);

@@ -25,7 +25,6 @@ import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
 // share one contract instead of two guesses. S03 owns park/wake honesty: state=blocked rows
 // legitimately wait; only an undelivered human notice is a delivery finding.
 
-import { defaultResolveOrchestrator } from "./queue-owner.js";
 import type Database from "better-sqlite3";
 import { deriveCrossHostSuccessorId, hasLinkedSuccessor, matchesRecordedHandoffTarget, QueueRepositoryError, type QueueItem, type QueueRepository } from "./queue-repository.js";
 import { stalledPickupFinding } from "./queue-pickup.js";
@@ -427,7 +426,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       }
       if (deps.resolveOrchestrator) return deps.resolveOrchestrator(session);
       const route = resolveEscalationOwner(deps.db, session, target => deps.queueRepo.acceptsDestination(target));
-      routeNotes.set(row.qitemId, route.reason);
+      if (route.outcome !== "none" && route.outcome !== "parent") routeNotes.set(row.qitemId, route.reason);
       if (route.outcome === "routed") routed.add(row.qitemId);
       return route.owner;
     };

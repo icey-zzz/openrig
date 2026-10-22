@@ -223,6 +223,22 @@ describe("same-daemon escalation routes (#605)", () => {
     expect(queue.getById(aggregate.qitemId)!.destinationSession).toBe(b.session);
   });
 
+  it("waiting projections name the same cross-rig owner as both executing engines", async () => {
+    const a = seat("a", "top.lead", "lead@a");
+    const b = seat("b", "top.lead", "lead@b");
+    rigs.addEdge(a.rig.id, a.node.id, "lead@b", "escalates_to");
+    const unclaimed = await work(a.session);
+    expect(queue.waitingView(unclaimed.qitemId)!.nextBackstop.owner).toBe(b.session);
+    const baton = await work(a.session, true);
+    db.prepare("UPDATE queue_items SET last_nudge_result='delivered-ack-pending' WHERE qitem_id=?").run(baton.qitemId);
+    expect(queue.waitingView(baton.qitemId)!.nextBackstop).toMatchObject({ owner: b.session, mechanism: "queue-wake-ladder:orchestrator" });
+    db.prepare("UPDATE queue_items SET tags=? WHERE qitem_id=?").run(JSON.stringify([ESCALATION_HOP_TAG]), unclaimed.qitemId);
+    expect(queue.waitingView(unclaimed.qitemId)!.nextBackstop.owner).toBe(a.session);
+    queue = new QueueRepository(db, new EventBus(db), { validateRig: destination => destination !== b.session,
+      loadHumanRegistry: () => ({ ok: true, entities: [] }) });
+    expect(queue.waitingView(baton.qitemId)!.nextBackstop.owner).not.toBe(b.session);
+  });
+
   it("exports deferred declarations without needing their targets to exist", () => {
     const a = seat("a", "lead", "lead@a");
     rigs.addEdge(a.rig.id, a.node.id, "absent@b", "escalates_to");
