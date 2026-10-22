@@ -215,6 +215,8 @@ describe("same-daemon escalation routes (#605)", () => {
     const original = await work(a.session, true);
     const aggregate = await queue.create({ sourceSession: "sender@lane", destinationSession: b.session,
       body: "Existing recovery", nudge: false, tags: ["wake-escalation", `wake-escalation:${a.session}`, `recovery-for:${original.qitemId}`] });
+    db.prepare("UPDATE queue_items SET last_nudge_result='delivered-ack-pending' WHERE qitem_id=?").run(original.qitemId);
+    expect(queue.waitingView(original.qitemId)!.nextBackstop.owner).toBe(b.session);
     const attempts: Array<[string, string]> = [];
     await runWakeLadderTick({ db, queueRepo: queue, status: createWakeLadderStatus(), retryCap: 0,
       log: () => {}, attemptWake: async (id, target) => { attempts.push([id, target]); return "verified"; } });

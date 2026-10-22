@@ -525,7 +525,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string, a
   }
   const suspension = readSuspension(db, row.destinationSession, resolveWakeSwapGraceSeconds(), now);
   if (suspension) due = Math.max(due, Date.parse(suspension.until));
-  const orch = escalationOwner();
+  const orch = disposition?.destination_session ?? escalationOwner();
   const operator = ladder.orchRung || orch === null || orch === row.destinationSession;
   return {
     owner: retry ? row.destinationSession : operator ? resolveOperatorSeat() ?? row.sourceSession : orch!,
@@ -1209,9 +1209,10 @@ async function advancePromptRefusals(
       fresh && fresh.destinationSession === dest && ["pending", "in-progress", "blocked"].includes(fresh.state)))) continue;
     if (!view.orchRung) {
       if (!toOperator) {
-        const outcome = await attemptWake(row.qitemId, orch!);
-        appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator -> ${orch} outcome=${outcome} reason=${reason}`);
-        actions.push({ qitemId: row.qitemId, action: "escalate-orchestrator", target: orch! });
+        const recoveryOwner = row.destinationSession;
+        const outcome = await attemptWake(row.qitemId, recoveryOwner);
+        appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator -> ${recoveryOwner} outcome=${outcome} reason=${reason}`);
+        actions.push({ qitemId: row.qitemId, action: "escalate-orchestrator", target: recoveryOwner });
         if (!outcome.startsWith("failed:")) appendExhausted(deps.queueRepo, row, `escalated to orchestrator (${outcome})`);
         continue;
       }
