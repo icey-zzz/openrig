@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { stringify } from "yaml";
 import { prepareHermeticEnv, type HermeticScaffold } from "./helpers/hermetic-env.js";
 import { runRig, spawnScenarioDaemon, type ScenarioDaemon } from "./helpers/scenario-daemon.js";
 
 // The YAML scenario runner has no bound edge-add or sweep verbs. This journey uses
 // the same private daemon/tmux scaffold, actual CLI and the daemon's scheduled sweep.
-const rigBin = resolve("packages/cli/dist/bin-wrapper.js");
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const rigBin = join(repoRoot, "packages/cli/dist/bin-wrapper.js");
 let scaffold: HermeticScaffold | undefined;
 let daemon: ScenarioDaemon | undefined;
 let db: Database.Database | undefined;
@@ -24,7 +26,7 @@ beforeAll(async () => {
   scaffold = prepareHermeticEnv({ baseEnv: { PATH: process.env.PATH, TERM: "xterm-256color" } });
   scaffold.env.OPENRIG_QUEUE_STUCK_SWEEP_INTERVAL_SECONDS = "1";
   scaffold.env.OPENRIG_QUEUE_STUCK_SWEEP_UNCLAIMED_AGE_MINUTES = "1";
-  cpSync(resolve("packages/test-system/scenarios/agents/worker"), join(scaffold.root, "worker-agent"), { recursive: true });
+  cpSync(join(repoRoot, "packages/test-system/scenarios/agents/worker"), join(scaffold.root, "worker-agent"), { recursive: true });
   daemon = await spawnScenarioDaemon(scaffold, { rigBin });
   db = new Database(join(scaffold.stateDir, "scenario.db"));
 }, 120_000);
