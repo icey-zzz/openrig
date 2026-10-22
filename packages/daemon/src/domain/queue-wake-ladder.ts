@@ -1,3 +1,4 @@
+import { resolveEscalationOwner, ESCALATION_HOP_TAG } from "./escalation-owner.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
@@ -630,7 +631,9 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     const windowMin = deps.unconfirmedWindowMinutes ?? resolveWakeUnconfirmedWindowMinutes();
     const graceS = deps.swapGraceSeconds ?? resolveWakeSwapGraceSeconds();
     const resolveOrch =
-      deps.resolveOrchestrator ?? ((session: string) => defaultResolveOrchestrator(deps.db, session));
+      deps.resolveOrchestrator ?? ((session: string) => {
+        return resolveEscalationOwner(deps.db, session, target => deps.queueRepo.acceptsDestination(target)).owner;
+      });
     const attemptWake =
       deps.attemptWake ??
       (async (qitemId: string, target: string): Promise<string> => {
@@ -834,7 +837,11 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     // F3 — per-destination aggregation: ONE escalation carrying the row list, refreshed
     // not duplicated (the S02 idempotency shape), and rung markers on every member baton.
     for (const [dest, members] of escalating) {
-      const orch = resolveOrch(dest);
+      const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
+      const orch = oneHop ? null : resolveOrch(dest);
+      const routeReason = oneHop ? "escalates_to one-hop delivery already used; existing fallback retained"
+        : !deps.resolveOrchestrator ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)).reason : "";
+      for (const member of members) if (routeReason) member.reason += `; ${routeReason}`;
 
       // F3 — the aggregate refresh is detection-gated (the S02 idempotency shape): a
       // live escalation group refreshes its one open row every pass, no wake attached.
@@ -867,14 +874,16 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           }
         } else {
           const escRow = await ensureEscalationRow(deps, dest, orch, members, reason);
-          const outcome = await attemptWake(escRow.qitemId, orch);
+          // An already-open recovery retains its owner, including a claim made before topology changed.
+          const recoveryOwner = deps.queueRepo.getById(escRow.qitemId)?.destinationSession ?? orch;
+          const outcome = await attemptWake(escRow.qitemId, recoveryOwner);
           for (const m of needsOrchRung) {
             appendMarker(
               deps.queueRepo,
               m.row,
-              `${LADDER_RUNG_PREFIX} orchestrator -> ${orch} outcome=${outcome} reason=${m.reason}`,
+              `${LADDER_RUNG_PREFIX} orchestrator -> ${recoveryOwner} outcome=${outcome} reason=${m.reason}`,
             );
-            actions.push({ qitemId: m.row.qitemId, action: "escalate-orchestrator", target: orch });
+            actions.push({ qitemId: m.row.qitemId, action: "escalate-orchestrator", target: recoveryOwner });
             if (!outcome.startsWith("failed:")) {
               // Delivered (or durable-unconfirmed — the aggregate row itself is now the
               // orchestrator's durable obligation; S02 nets it if it sits unclaimed).
@@ -1158,9 +1167,12 @@ async function advancePromptRefusals(
     for (const row of selfRecoveries.values()) {
       if (!group.rows.has(row.qitemId)) members.push({ row, reason: "recovery fallback also targets the prompt-blocked seat" });
     }
-    const orch = resolveOrch(dest);
+    const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
+    const orch = oneHop ? null : resolveOrch(dest);
     const toOperator = orch === null || orch === dest;
-    const reason = "interactive prompt blocks outstanding work; no input was sent";
+    const reason = "interactive prompt blocks outstanding work; no input was sent"
+      + (oneHop ? "; escalates_to one-hop delivery already used; existing fallback retained"
+        : !deps.resolveOrchestrator ? `; ${resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)).reason}` : "");
     const aggregate = await ensureEscalationRow(deps, dest,
       toOperator ? resolveOperatorSeat() ?? members[0]?.row.sourceSession ?? [...group.jobs.values()][0]! : orch!, members, reason,
       `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...group.keys], group.jobs);
@@ -1345,12 +1357,17 @@ async function ensureEscalationRow(
     members.map((m) => `- ${m.row.qitemId}: ${m.row.summary ?? "outstanding work"} (${m.reason})`).join("\n") +
     (jobs.size ? `\nwatchdog reminders refused at its prompt (${jobs.size}):\n${[...jobs.keys()].map(id => `- ${id}`).join("\n")}` : "") +
     `\nThe rows above still carry their obligations exactly-once; this escalation is the wake, not the content.`;
+  const route = !deps.resolveOrchestrator
+    ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
+  const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG))
+    || (route?.outcome === "routed" && route.owner === orch);
   const created = await deps.queueRepo.create({
     sourceSession: members[0]?.row.sourceSession ?? [...jobs.values()][0]!,
     destinationSession: orch,
     body,
     summary: `Wake escalation: ${members.length} baton(s)${jobs.size ? ` and ${jobs.size} watchdog reminder(s)` : ""} stuck at ${dest} — ${reason}`,
-    tags: [WAKE_ESCALATION_TAG, dedupTag, ...extraTags, ...members.map(m => recoveryTag(m.row.qitemId))],
+    tags: [WAKE_ESCALATION_TAG, dedupTag,
+      ...(oneHop ? [ESCALATION_HOP_TAG] : []), ...extraTags, ...members.map(m => recoveryTag(m.row.qitemId))],
     nudge: false, // delivery is the ladder's own rung attempt, recorded with its outcome
   });
   return { qitemId: created.qitemId };
