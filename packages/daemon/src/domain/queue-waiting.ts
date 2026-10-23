@@ -1,4 +1,4 @@
-import { resolveEscalationOwner, ESCALATION_HOP_TAG } from "./escalation-owner.js";
+import { resolveEscalationOwner, hasConsumedEscalationHop } from "./escalation-owner.js";
 import type Database from "better-sqlite3";
 import { resolvePickupThresholdMinutes } from "./queue-pickup.js";
 import { SettingsStore } from "./user-settings/settings-store.js";
@@ -72,7 +72,7 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
     "SELECT destination_session, state FROM queue_items WHERE qitem_id = ?",
   ).get(row.blocked_on) as { destination_session: string; state: string } | undefined : undefined;
   let recoveryOwner: string | null = null;
-  try { recoveryOwner = JSON.parse(row.tags ?? "[]").includes(ESCALATION_HOP_TAG)
+  try { recoveryOwner = hasConsumedEscalationHop(db, id)
     ? null : resolveEscalationOwner(db, row.destination_session, acceptsDestination).owner; } catch { /* bootstrap schema has no routing evidence */ }
   const subject = row.blocked_on ? blocker?.destination_session ?? row.blocked_on : row.destination_session;
   let observed: ReturnType<WaitingActivityReader> = null;

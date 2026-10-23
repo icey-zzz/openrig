@@ -2,6 +2,17 @@ import type Database from "better-sqlite3";
 import { defaultResolveOrchestrator, resolveSessionNodeId } from "./queue-owner.js";
 
 export const ESCALATION_HOP_TAG = "escalation-route:one-hop";
+/** A consumed hop belongs to this recovery's handoff ancestry, never its recipient's other work. */
+export function hasConsumedEscalationHop(db: Database.Database, qitemId: string): boolean {
+  return Boolean(db.prepare(`WITH RECURSIVE ancestry(qitem_id, handed_off_from, tags) AS (
+    SELECT qitem_id, handed_off_from, tags FROM queue_items WHERE qitem_id = ?
+    UNION
+    SELECT q.qitem_id, q.handed_off_from, q.tags FROM queue_items q
+      JOIN ancestry a ON q.qitem_id = a.handed_off_from
+  ) SELECT 1 FROM ancestry WHERE json_valid(tags)
+    AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?) LIMIT 1`).get(qitemId, ESCALATION_HOP_TAG));
+}
+
 export interface EscalationOwner {
   owner: string | null;
   outcome: "parent" | "none" | "routed" | "unavailable" | "ambiguous" | "self" | "cycle" | "unknown";

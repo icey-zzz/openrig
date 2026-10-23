@@ -8,7 +8,7 @@ import type { StatusDeps } from "./status.js";
 
 interface EdgeEnd {
   logicalId: string;
-  nodeId: string;
+  nodeId: string | null;
 }
 
 interface EdgeSuccess {
@@ -39,7 +39,8 @@ function report(result: EdgeOpResult, opts: { json?: boolean }): void {
     switch (result.outcome) {
       case "would_add":
         console.log(`plan     add ${line} in rig ${result.rigId}`);
-        console.log(`         from node ${edge.from.nodeId}, to node ${edge.to.nodeId}`);
+        console.log(`         from node ${edge.from.nodeId}, to ${edge.to.nodeId === null
+          ? `${edge.to.logicalId} (resolved when used)` : `node ${edge.to.nodeId}`}`);
         console.log("         nothing written (--plan)");
         break;
       case "added":

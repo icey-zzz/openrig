@@ -1,4 +1,4 @@
-import { resolveEscalationOwner, ESCALATION_HOP_TAG } from "./escalation-owner.js";
+import { resolveEscalationOwner, ESCALATION_HOP_TAG, hasConsumedEscalationHop } from "./escalation-owner.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
@@ -481,7 +481,7 @@ export function readWakeLadderBackstop(db: Database.Database, qitemId: string, a
     last_nudge_attempt AS lastNudgeAttempt, ts_created AS tsCreated, tags AS tagsJson FROM queue_items WHERE qitem_id = ?`)
     .get(qitemId) as Pick<QueueItem, "qitemId" | "state" | "sourceSession" | "destinationSession" | "claimedAt" | "handedOffFrom" | "lastHeartbeat" | "lastNudgeResult" | "lastNudgeAttempt" | "tsCreated"> & { tagsJson: string | null } | undefined;
   if (!row || !["pending", "in-progress"].includes(row.state)) return null;
-  const escalationOwner = () => JSON.parse(row.tagsJson ?? "[]").includes(ESCALATION_HOP_TAG)
+  const escalationOwner = () => hasConsumedEscalationHop(db, qitemId)
     ? null : resolveEscalationOwner(db, row.destinationSession, acceptsDestination).owner;
   const recovery = findWakeRecovery(db, qitemId);
   const disposition = recovery ? db.prepare("SELECT destination_session, tags FROM queue_items WHERE qitem_id = ?")
@@ -830,6 +830,16 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
         mode === "failed"
           ? `wake failed ${view.attempts} times over ${minutesSince(view.firstMarkerTs ?? row.tsCreated, now)} min`
           : `unconfirmed delivery with no pickup evidence over ${minutesSince(row.tsCreated, now)} min`;
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) {
+        if (!due || suspended) continue;
+        const consumedReason = `${reason}; escalates_to one-hop delivery already used; existing fallback retained`;
+        if (!view.orchRung) appendMarker(deps.queueRepo, row, `${LADDER_RUNG_PREFIX} orchestrator self-skip reason=${consumedReason}`);
+        if (await operatorRung(deps, row, consumedReason, actions, view)) {
+          appendExhausted(deps.queueRepo, row, "consumed escalation hop reached operator fallback");
+          exhaustedThisTick += 1;
+        }
+        continue;
+      }
       const dest = row.destinationSession;
       if (!escalating.has(dest)) escalating.set(dest, []);
       escalating.get(dest)!.push({ row, view, mode, reason, due, suspended });
@@ -838,12 +848,10 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     // F3 — per-destination aggregation: ONE escalation carrying the row list, refreshed
     // not duplicated (the S02 idempotency shape), and rung markers on every member baton.
     for (const [dest, members] of escalating) {
-      const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
-      const orch = oneHop ? null : resolveOrch(dest);
+      const orch = openEscalationOwner(deps.db, escalationDedupTag(dest)) ?? resolveOrch(dest);
       const route = !deps.resolveOrchestrator
         ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
-      const routeReason = oneHop ? "escalates_to one-hop delivery already used; existing fallback retained"
-        : route && route.outcome !== "none" && route.outcome !== "parent" ? route.reason : "";
+      const routeReason = route && route.outcome !== "none" && route.outcome !== "parent" ? route.reason : "";
       for (const member of members) if (routeReason) member.reason += `; ${routeReason}`;
 
       // F3 — the aggregate refresh is detection-gated (the S02 idempotency shape): a
@@ -1157,6 +1165,7 @@ async function advancePromptRefusals(
     // retaining its original body/custody, rather than treating it as delivery.
     const selfRecoveries = new Map<string, QueueItem>();
     const ownedElsewhere = members.some(({ row }) => {
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) return false;
       const recovery = findQueueRecovery(deps.db, row.qitemId);
       if (!recovery || !["pending", "in-progress", "blocked"].includes(recovery.state)) return false;
       const held = deps.queueRepo.getById(recovery.qitemId);
@@ -1170,14 +1179,32 @@ async function advancePromptRefusals(
     for (const row of selfRecoveries.values()) {
       if (!group.rows.has(row.qitemId)) members.push({ row, reason: "recovery fallback also targets the prompt-blocked seat" });
     }
-    const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG));
-    const orch = oneHop ? null : resolveOrch(dest);
+    // A consumed recovery owns its own operator continuation. It must not change
+    // the route or one-hop marker of unrelated work/watchdogs at the same prompt.
+    for (let i = members.length - 1; i >= 0; i--) {
+      const member = members[i]!;
+      if (!hasConsumedEscalationHop(deps.db, member.row.qitemId)) continue;
+      const recovery = findQueueRecovery(deps.db, member.row.qitemId);
+      if (recovery && ["pending", "in-progress", "blocked"].includes(recovery.state)
+        && deps.queueRepo.getById(recovery.qitemId)?.destinationSession !== dest) {
+        members.splice(i, 1);
+        continue;
+      }
+      const view = readLadder(deps.db, member.row.qitemId, 0);
+      if (!view.exhausted && (view.lastMarkerTs === null || now.getTime() - view.lastMarkerTs >= intervalS * 1000)) {
+        const reason = "interactive prompt blocks recovery; escalates_to one-hop delivery already used; existing fallback retained";
+        if (!view.orchRung) appendMarker(deps.queueRepo, member.row, `${LADDER_RUNG_PREFIX} orchestrator self-skip reason=${reason}`);
+        if (await operatorRung(deps, member.row, reason, actions, view, false)) appendExhausted(deps.queueRepo, member.row, "consumed escalation hop reached operator fallback");
+      }
+      members.splice(i, 1);
+    }
+    if (!members.length && !group.jobs.size) continue;
+    const orch = openEscalationOwner(deps.db, `prompt-destination:${dest}`) ?? resolveOrch(dest);
     const toOperator = orch === null || orch === dest;
     const route = !deps.resolveOrchestrator
       ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
     const reason = "interactive prompt blocks outstanding work; no input was sent"
-      + (oneHop ? "; escalates_to one-hop delivery already used; existing fallback retained"
-        : route && route.outcome !== "none" && route.outcome !== "parent" ? `; ${route.reason}` : "");
+      + (route && route.outcome !== "none" && route.outcome !== "parent" ? `; ${route.reason}` : "");
     const aggregate = await ensureEscalationRow(deps, dest,
       toOperator ? resolveOperatorSeat() ?? members[0]?.row.sourceSession ?? [...group.jobs.values()][0]! : orch!, members, reason,
       `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...group.keys], group.jobs);
@@ -1334,6 +1361,13 @@ async function refreshEscalationRowIfExists(
   })();
 }
 
+/** Existing recovery custody takes precedence over a newly resolved topology fallback. */
+function openEscalationOwner(db: Database.Database, dedupTag: string): string | null {
+  return (db.prepare(`SELECT destination_session FROM queue_items WHERE state IN ('pending','in-progress','blocked')
+    AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?) LIMIT 1`)
+    .get(dedupTag) as { destination_session: string } | undefined)?.destination_session ?? null;
+}
+
 async function ensureEscalationRow(
   deps: WakeLadderDeps,
   dest: string,
@@ -1365,8 +1399,7 @@ async function ensureEscalationRow(
     `\nThe rows above still carry their obligations exactly-once; this escalation is the wake, not the content.`;
   const route = !deps.resolveOrchestrator
     ? resolveEscalationOwner(deps.db, dest, target => deps.queueRepo.acceptsDestination(target)) : null;
-  const oneHop = members.some(m => m.row.tags?.includes(ESCALATION_HOP_TAG))
-    || (route?.outcome === "routed" && route.owner === orch);
+  const oneHop = route?.outcome === "routed" && route.owner === orch;
   const created = await deps.queueRepo.create({
     sourceSession: members[0]?.row.sourceSession ?? [...jobs.values()][0]!,
     destinationSession: orch,

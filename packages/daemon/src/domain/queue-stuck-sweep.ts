@@ -1,4 +1,4 @@
-import { resolveEscalationOwner, ESCALATION_HOP_TAG } from "./escalation-owner.js";
+import { resolveEscalationOwner, ESCALATION_HOP_TAG, hasConsumedEscalationHop } from "./escalation-owner.js";
 import { findQueueRecovery, recoveryId, recoveryTag } from "./queue-recovery.js";
 import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { queueWaitNotice } from "./queue-wait-backoff.js";
@@ -420,7 +420,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     const routeNotes = new Map<string, string>();
     const routed = new Set<string>();
     const resolveOrch = (session: string, row: QueueItem): string | null => {
-      if (row.tags?.includes(ESCALATION_HOP_TAG)) {
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) {
         routeNotes.set(row.qitemId, "escalates_to one-hop delivery already used; existing fallback retained");
         return null;
       }
