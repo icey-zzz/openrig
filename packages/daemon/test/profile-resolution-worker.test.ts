@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { execFileSync, fork } from "node:child_process";
 import { once } from "node:events";
 import { resolveNodeConfig, type ResolutionContext } from "../src/domain/profile-resolver.js";
 import { resolveNodeConfigAsync, withNodeConfigResolver } from "../src/domain/profile-resolution-worker.js";
@@ -56,6 +57,37 @@ describe("profile resolution outside the daemon request thread", () => {
   it("serves a health request while a missing skill requires scanning a large library", async () => {
     const ctx = fixture();
     for (let i = 0; i < 1000; i++) skill(ctx, `skill-${i}`, `skill-${i}`);
+    // The FIFO holds a real fallback scan until health responds, independent of disk speed.
+    // A separate process releases it on timeout too, so a synchronous regression fails
+    // the assertion below instead of hanging the request thread forever.
+    const gate = join(ctx.homedir!, ".agents", "skills", "scan-gate", "SKILL.md");
+    mkdirSync(join(gate, ".."), { recursive: true });
+    execFileSync("mkfifo", [gate]);
+    const helper = join(ctx.homedir!, "scan-gate.cjs");
+    writeFileSync(helper, `
+      const fs = require("node:fs/promises");
+      (async () => {
+        const gate = process.argv[2];
+        const handle = await fs.open(gate, "w");
+        let release;
+        const released = new Promise(resolve => { release = resolve; });
+        process.on("message", release);
+        const deadline = setTimeout(release, 5000);
+        process.send("scan-started");
+        await released;
+        clearTimeout(deadline);
+        const content = "---\\nname: scan-gate\\ndescription: Test skill\\n---\\nBody\\n";
+        // Further scans see a regular file, while the first reader keeps its open FIFO.
+        await fs.unlink(gate);
+        await fs.writeFile(gate, content);
+        await handle.writeFile(content);
+        await handle.close();
+        process.disconnect();
+      })().catch(error => { console.error(error); process.exit(1); });
+    `);
+    const writer = fork(helper, [gate], { execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    const scanStarted = once(writer, "message");
+    const writerExited = once(writer, "exit");
     const server = createServer((_req, res) => { res.end("healthy"); });
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
@@ -69,16 +101,21 @@ describe("profile resolution outside the daemon request thread", () => {
       },
     }).then(result => { completed = true; return result; });
     try {
+      expect((await scanStarted)[0]).toBe("scan-started");
       const response = await fetch(`http://127.0.0.1:${port}/healthz`);
       expect(await response.text()).toBe("healthy");
       expect(completed).toBe(false);
+      writer.send("release", () => {});
       const result = await resolution;
       expect(result.ready).toBe(false);
       expect(result.errors.some(error => error.includes("wanted"))).toBe(true);
     } finally {
+      if (writer.connected) writer.send("release", () => {});
       await resolution.catch(() => undefined);
+      const [exitCode] = await writerExited;
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));
+      expect(exitCode).toBe(0);
     }
   });
 
