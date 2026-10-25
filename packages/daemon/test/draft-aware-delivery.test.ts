@@ -45,8 +45,12 @@ function fixture(saved?: Buffer, opts: { runtime?: string; idleHook?: boolean } 
   const bodies: Record<string, string | null> = { a: "", b: "" };
   const history: Record<string, string> = { a: "", b: "" };
   const writes: string[] = [], submissions: string[] = [];
+  const observations: unknown[] = [];
   const hooks: { load?: () => void | Promise<void>; paste?: () => void | Promise<void>; sleep?: (ms: number) => void | Promise<void> } = {};
   let staged = "";
+  // A terminal pane shows a submitted line as typed; an agent pane echoes a sent message under its prompt, as Claude does.
+  const echo = (node: string, body: string) => (db.prepare("SELECT runtime FROM nodes WHERE id=?").get(node) as { runtime: string }).runtime === "terminal"
+    ? `${body}\n` : `${body.split("\n").map((row, i) => (i ? "  " : "❯ ") + row).join("\n")}\n`;
   const tmux = new TmuxAdapter(async command => {
     if (command.includes("load-buffer")) await hooks.load?.();
     const node = command.includes("%2") ? "b" : "a";
@@ -57,7 +61,7 @@ function fixture(saved?: Buffer, opts: { runtime?: string; idleHook?: boolean } 
     if (command.includes("send-keys")) {
       writes.push(`keys:${node}:${command}`);
       if (command.includes("Enter")) {
-        submissions.push(bodies[node] ?? ""); history[node] += `${bodies[node]}\n`; bodies[node] = "";
+        submissions.push(bodies[node] ?? ""); history[node] += echo(node, bodies[node] ?? ""); bodies[node] = "";
       }
     }
     return "";
@@ -75,7 +79,8 @@ function fixture(saved?: Buffer, opts: { runtime?: string; idleHook?: boolean } 
   let at = Date.now();
   const rigRepo = new RigRepository(db), sessionRegistry = new SessionRegistry(db), outbox = new OutboxHandler(db);
   const transport = new SessionTransport({ db, tmuxAdapter: tmux, rigRepo, sessionRegistry, now: () => new Date(at), sleep: async ms => { await hooks.sleep?.(ms); },
-    agentActivityStore: { getLatestForNode: () => opts.idleHook === false ? null
+    eventBus: new EventBus(db), captureObserver: { record: input => { observations.push(input); } },
+    agentActivityStore: { resolveSession: () => ({ rigId: "rig", nodeId: "a", sessionName: "worker@test" }), getLatestForNode: () => opts.idleHook === false ? null
       : ({ state: "idle", reason: "fixture idle hook", evidenceSource: "runtime_hook", sampledAt: new Date(at).toISOString(), evidence: null }) } as never });
   const guarded = transport.guardedDelivery!;
   const repo = new QueueRepository(db, new EventBus(db), { transport, loadHumanRegistry: () => ({ ok: true, entities: [], warnings: [] }) });
@@ -87,7 +92,7 @@ function fixture(saved?: Buffer, opts: { runtime?: string; idleHook?: boolean } 
   });
   app.route("/api/seat", seatRoutes); app.route("/api/transport", transportRoutes());
   cleanup.push(async () => { await guarded.stop(); db.close(); });
-  return { db, guard, tmux, transport, guarded, outbox, repo, app, bodies, history, writes, submissions, hooks,
+  return { db, guard, tmux, transport, observations, guarded, outbox, repo, app, bodies, history, writes, submissions, hooks,
     advance: (ms = 4000) => { at += ms; },
     enable: (settings = {}) => guard.set("a", { mode: "draft-aware", ...settings }, "human@test", "keep draft"),
     send: (id: string, text = "incoming message", opts: SendOpts = {}) => transport.send("worker@test", text, { deliveryId: id, actorSession: "human@test", verify: true, ...opts }),
@@ -102,6 +107,79 @@ describe("current draft-aware delivery through the real transport", () => {
     expect(await f.send("ordinary", text)).toMatchObject({ ok: true, sent: true });
     expect(await f.send("ordinary", text)).toMatchObject({ ok: true, sent: true });
     expect(f.submissions).toEqual([text, text]);
+  });
+
+  it("submits its delayed collapsed paste once, leaving the next queue wake deliverable", async () => {
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
+    const text = "first line\nsecond line\nlast line";
+    let readsAfterPaste = 0;
+    vi.mocked(f.tmux.captureComposerSnapshot).mockImplementation(async name => {
+      const body = f.bodies[f.guard.target(name).nodeId];
+      if (body === text) return frame(readsAfterPaste++ === 0 ? "" : "[Pasted text #1 +2 lines]");
+      return body == null ? null : frame(body);
+    });
+    expect(await f.send("delayed-label", text, { verify: false })).toMatchObject({ ok: true, sent: true });
+    const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "next work", nudge: false });
+    f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
+    await f.repo.drainPendingWakeIntents();
+    expect(f.submissions).toEqual([text, expect.stringContaining(item.qitemId)]);
+    expect(f.writes.filter(write => write.startsWith("paste:"))).toHaveLength(2);
+    expect(f.writes.filter(write => write.startsWith("keys:"))).toHaveLength(2);
+    expect(f.bodies.a).toBe("");
+    expect(f.outbox.getById("wake-intent-" + item.qitemId)!.deliveryState).toBe("delivered");
+  });
+
+  it("does not submit a person's replacement paste after recording its own label", async () => {
+    const f = fixture(); await f.enable();
+    const text = "first line\nsecond line\nlast line", draft = "different first\ndifferent second\ndifferent last";
+    vi.mocked(f.tmux.captureComposerSnapshot).mockImplementation(async name => {
+      const body = f.bodies[f.guard.target(name).nodeId];
+      return body == null ? null : frame(body === text ? "[Pasted text #1 +2 lines]" : body === draft ? "[Pasted text #2 +2 lines]" : body);
+    });
+    // A person attached directly replaces the draft; no broker humanInput call updates the epoch.
+    f.hooks.sleep = ms => { if (ms === 200) f.bodies.a = draft; };
+    expect(await f.send("replacement-label", text, { verify: false })).toMatchObject({ ok: false, sent: true, reason: "draft_input_changed" });
+    expect(f.submissions).toEqual([]);
+    expect(f.writes).toHaveLength(1);
+    expect(f.bodies.a).toBe(draft);
+  });
+
+  it.each(["wrong count", "moved cursor", "changed composer", "human input"])("does not submit a delayed label after %s", async condition => {
+    const f = fixture(); await f.enable();
+    const text = "first line\nsecond line\nlast line";
+    let readsAfterPaste = 0;
+    vi.mocked(f.tmux.captureComposerSnapshot).mockImplementation(async name => {
+      const body = f.bodies[f.guard.target(name).nodeId];
+      if (body !== text) return body == null ? null : frame(body);
+      if (readsAfterPaste++ === 0) return frame("");
+      const snapshot = frame(condition === "wrong count" ? "[Pasted text #1 +9 lines]" : "[Pasted text #1 +2 lines]");
+      if (condition === "moved cursor") snapshot.cursor.x--;
+      if (condition === "changed composer") snapshot.cursor.width--;
+      return snapshot;
+    });
+    if (condition === "human input") f.hooks.sleep = async ms => {
+      if (ms === 200) await f.guard.humanInput("worker@test", async () => {});
+    };
+    const result = await f.send("unowned-label", text, { verify: false });
+    expect(result).toMatchObject({ ok: false, sent: true, reason: "draft_input_changed" });
+    expect(result.error).toContain("Enter was not sent");
+    expect(f.submissions).toEqual([]);
+    expect(f.bodies.a).toBe(text);
+    expect(f.writes).toHaveLength(1);
+  });
+
+  it("retains the next wake behind an uncertain native Enter without submitting or replaying the leftover", async () => {
+    const f = fixture(); await f.enable();
+    const enter = vi.spyOn(f.tmux, "sendKeys").mockResolvedValueOnce({ ok: false, code: "tmux_error", message: "lost Enter result" });
+    const first = await f.send("uncertain-enter");
+    expect(first).toMatchObject({ ok: false, reason: "submit_failed" });
+    expect(first.error).toContain("submission outcome is unconfirmed");
+    expect(f.outbox.getById(first.outboxIds![0]!)!.deliveryState).toBe("indeterminate");
+    expect(await f.send("next-wake")).toMatchObject({ outcome: "retained", sent: false, reason: "draft_input_busy" });
+    expect(enter).toHaveBeenCalledTimes(1);
+    expect(f.writes).toHaveLength(1);
+    expect(f.submissions).toEqual([]);
+    expect(f.bodies.a).toBe("incoming message");
   });
 
   it("tries a current request after the person's draft clears, without replaying a saved prerequisite", async () => {
@@ -267,7 +345,7 @@ describe("current draft-aware delivery through the real transport", () => {
 
 describe("supported seat and queue integration", () => {
   it.each(["failed", "indeterminate", "sending"])("startup recovery attempts a still-current %s queue wake", async state => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     const id = "wake-intent-" + item.qitemId;
@@ -289,7 +367,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it.each(["delivered", "retained", "retired"])("startup recovery leaves a %s queue wake alone", async state => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     const id = "wake-intent-" + item.qitemId;
@@ -303,7 +381,7 @@ describe("supported seat and queue integration", () => {
 
   it.each(["closed", "claimed", "reassigned", "absent-pane", "replacement"].flatMap(state =>
     [false, true].map(draftAware => ({ state, draftAware }))))("recovery does not paste for $state work (draft-aware: $draftAware)", async ({ state, draftAware }) => {
-    const f = fixture(); if (draftAware) await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); if (draftAware) await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     const id = "wake-intent-" + item.qitemId;
@@ -321,7 +399,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it("tries a failed recovery once per pass even when the native result stays unknown", async () => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     const id = "wake-intent-" + item.qitemId;
@@ -335,7 +413,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it("keeps earlier uncertainty when a recovery fails before input", async () => {
-    const f = fixture();
+    const f = fixture(undefined, { runtime: "claude-code" });
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "work", nudge: false });
     const id = "wake-intent-" + item.qitemId;
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
@@ -348,7 +426,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it("does not describe an earlier attempt for a never-attempted pending wake", async () => {
-    const f = fixture();
+    const f = fixture(undefined, { runtime: "claude-code" });
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "work", nudge: false });
     f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     await f.repo.drainPendingWakeIntents();
@@ -357,7 +435,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it("reads current recovery candidates without visiting historical uncertain notifications", async () => {
-    const f = fixture();
+    const f = fixture(undefined, { runtime: "claude-code" });
     const old = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "old work", nudge: false });
     f.db.prepare("UPDATE queue_items SET state='done' WHERE qitem_id=?").run(old.qitemId);
     f.db.transaction(() => { for (let i = 0; i < 600; i++) f.outbox.record({ outboxId: `wake-intent-history-${i}`, senderSession: "sender@test", destinationSession: "worker@test", body: "historical", auditPointer: old.qitemId }); })();
@@ -373,7 +451,7 @@ describe("supported seat and queue integration", () => {
 
   it.each(["draft_input_changed", "delivery_indeterminate", "submit_failed", "send_failed"])(
     "keeps a committed wake's %s outcome indeterminate in the queue", async reason => {
-      const f = fixture(); await f.enable();
+      const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
       const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
       const id = "wake-intent-" + item.qitemId;
       f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
@@ -393,7 +471,7 @@ describe("supported seat and queue integration", () => {
   );
 
   it.each(["ladder", "legacy-boot"])("delivers a %s nudge without a precommitted outbox entry", async path => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     if (path === "ladder") await f.repo.maybeNudge(item.qitemId, "worker@test", true, "sender@test");
     else await f.repo.recoverLostNudge(item.qitemId, "worker@test", "sender@test");
@@ -404,7 +482,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it.each(["current", "closed", "reassigned"])("checks the %s queue facts without saved delivery bookkeeping", async state => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     f.db.exec("CREATE TRIGGER unavailable_nudge_receipt BEFORE UPDATE OF guard_delivery ON outbox_entries BEGIN SELECT RAISE(ABORT, 'fixture receipt unavailable'); END;");
     f.hooks.load = () => {
@@ -474,8 +552,9 @@ describe("supported seat and queue integration", () => {
     expect(f.submissions).toEqual(["sibling message", "incoming message"]);
   });
 
+  // Queue wakes go to an agent seat: a wake to a terminal seat types nothing before any draft check (gateway-destination-routing covers it).
   it("a held queue wake remains on the existing queue recovery path without a second scheduler", async () => {
-    const f = fixture(); await f.enable(); f.bodies.a = "draft";
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable(); f.bodies.a = "draft";
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work" });
     await vi.waitFor(() => expect(f.repo.getById(item.qitemId)!.lastNudgeResult).toBe("retained:draft_aware"));
     const id = "wake-intent-" + item.qitemId;
@@ -486,7 +565,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it("rechecks queue applicability before paste", async () => {
-    const f = fixture(); await f.enable();
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable();
     const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "queued work", nudge: false });
     const id = "wake-intent-" + item.qitemId; f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
     f.hooks.load = () => { f.db.prepare("UPDATE queue_items SET state='done' WHERE qitem_id=?").run(item.qitemId); };
@@ -496,7 +575,7 @@ describe("supported seat and queue integration", () => {
   });
 
   it.each([false, true])("coalesced wakes preserve every original ID and body (held: %s)", async held => {
-    const f = fixture(); await f.enable(); if (held) f.bodies.a = "draft"; const ids: string[] = [];
+    const f = fixture(undefined, { runtime: "claude-code" }); await f.enable(); if (held) f.bodies.a = "draft"; const ids: string[] = [];
     for (let i = 0; i < 2; i++) {
       const item = await f.repo.create({ sourceSession: "sender@test", destinationSession: "worker@test", body: "work " + i, nudge: false });
       f.repo.stageWakeIntent(item.qitemId, "sender@test", "worker@test", null, true);
@@ -510,5 +589,93 @@ describe("supported seat and queue integration", () => {
     expect(f.submissions).toHaveLength(held ? 0 : 1);
     ids.forEach((id, i) => expect(f.outbox.getById(id)).toMatchObject({ body: original[i], deliveryState: held ? "retained" : "delivered" }));
     expect(f.db.prepare("SELECT count(*) n FROM outbox_entries").get()).toEqual({ n: 2 });
+  });
+});
+
+
+describe("deliberate override preserves existing input", () => {
+  const override = { dangerouslyInteract: true, reason: "fixture interaction", verify: false };
+  it.each(["off", "draft-aware", "hold", "openrig-urgent", "urgent-only", "sends-only"])("stops and shows typed input under %s without retaining it", async mode => {
+    const f = fixture();
+    await f.guard.set("a", { mode }, "human@test", "fixture policy");
+    const draft = "私の下書き😀\n  second line U3-private";
+    // Arrives during buffer preparation, so a check before calling the adapter would be too early.
+    f.hooks.load = () => { f.bodies.a = draft; };
+    const res = await f.post("/api/transport/send", { session: "worker@test", text: "incoming override", ...override });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, sent: false, reason: "override_input_present", existingInput: {
+      classification: "typed_or_pasted", rows: draft.split("\n"), suggestionRows: [], fullContentsVisible: true,
+      target: { nodeId: "a", occupant: "g1", pane: "%1" }, cursor: expect.objectContaining({ y: 3 }),
+    } });
+    expect(f.writes).toEqual([]);
+    expect(f.bodies.a).toBe(draft);
+    expect(f.db.prepare("SELECT count(*) n FROM outbox_entries").get()).toEqual({ n: 0 });
+    expect(f.db.serialize().includes(Buffer.from("U3-private"))).toBe(false);
+    expect(f.observations).toEqual([]);
+  });
+
+  it.each([null, "[Pasted text #4 +18 lines]"])("shows unreadable or collapsed input honestly: %s", async body => {
+    const f = fixture(); f.bodies.a = body;
+    const result = await f.send("override", "incoming", override);
+    expect(result).toMatchObject({ ok: false, sent: false, existingInput: { classification: body === null ? "unreadable" : "typed_or_pasted", fullContentsVisible: false } });
+    expect(f.writes).toEqual([]);
+  });
+
+  it.each(["", "typed"])("separates the suggestion from %j and never stores either", async typed => {
+    const f = fixture(); const suggestion = " U3 suggestion private";
+    vi.mocked(f.tmux.captureComposerSnapshot).mockResolvedValue({ ...frame(`${typed}\x1b[2m${suggestion}\x1b[22m`),
+      cursor: { x: 2 + typed.length, y: 2, width: 240, height: 60 } });
+    const result = await f.send("override", "incoming", override);
+    expect(result).toMatchObject({ sent: typed === "" ? true : false, existingInput: {
+      classification: typed ? "typed_or_pasted" : "suggestion_only", rows: [typed], suggestionRows: [suggestion],
+    } });
+    expect(f.writes).toEqual(typed ? [] : ["paste:a:incoming"]); // Static suggestion frame never proves this answer staged for Enter.
+    expect(f.db.serialize().includes(Buffer.from(suggestion))).toBe(false);
+  });
+
+  it("the explicit unchecked option can drive unreadable input without clearing or retaining", async () => {
+    const f = fixture(); await f.guard.set("a", { mode: "hold" }, "human@test", "fixture quiet");
+    vi.mocked(f.tmux.captureComposerSnapshot).mockResolvedValue(null);
+    const result = await f.send("unchecked", "incoming", { ...override, typeWithoutChecking: true } as SendOpts);
+    expect(result).toMatchObject({ ok: true, sent: true, existingInput: { classification: "not_checked", cleared: false } });
+    expect(f.tmux.captureComposerSnapshot).not.toHaveBeenCalled();
+    expect(f.writes).toEqual(["paste:a:incoming"]);
+    expect(f.submissions).toEqual([]); // Unreadable input cannot prove the answer staged for Enter.
+  });
+
+  it.each(["R1-existing-draft", ""])("broadcast wait plus override checks current input before typing: %j", async draft => {
+    const f = fixture(); await f.guard.set("a", { mode: "hold" }, "human@test", "fixture quiet");
+    f.bodies.a = draft;
+    const response = await f.post("/api/transport/broadcast", { sessions: ["worker@test"], text: "outgoing", ...override, verify: true, waitForIdleMs: 100 });
+    expect(response.status).toBe(200);
+    const { results } = await response.json();
+    expect(results[0]).toMatchObject(draft
+      ? { ok: false, sent: false, reason: "override_input_present", existingInput: { rows: [draft], classification: "typed_or_pasted" } }
+      : { ok: true, sent: true, existingInput: { classification: "empty" } });
+    expect(f.writes).toEqual(draft ? [] : ["paste:a:outgoing"]);
+    expect(f.submissions).toEqual([]); // Terminal fixture cannot prove a native answer staged for Enter.
+    expect(f.observations).toEqual([]);
+    expect(f.db.serialize().includes(Buffer.from("R1-existing-draft"))).toBe(false);
+  });
+
+  it("unchecked API requests require explicit interaction and a reason", async () => {
+    const f = fixture();
+    for (const [route, dangerouslyInteract] of [["send", false], ["broadcast", true]] as const) {
+      const response = await f.post(`/api/transport/${route}`, { dangerouslyInteract, session: "worker@test", sessions: ["worker@test"], text: "ordinary", typeWithoutChecking: true });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ reason: "invalid_dangerously_interact" });
+    }
+    expect(f.writes).toEqual([]);
+  });
+
+  it("a recognised native prompt keeps its existing audited interaction", async () => {
+    const f = fixture(undefined, { idleHook: false, runtime: "codex" });
+    await f.guard.set("a", { mode: "hold" }, "human@test", "fixture quiet");
+    vi.mocked(f.tmux.capturePaneContent).mockResolvedValue("Codex update available.\n\n› 1. Update now\n  2. Skip this version\n  3. Remind me later\n\n  gpt-5.5 high · Context [████ ] · ~/example");
+    expect(await f.send("native-prompt", "y", override)).toMatchObject({ ok: true, sent: true });
+    expect(f.writes).toEqual(["paste:a:y"]);
+    const audit = f.db.prepare("SELECT payload FROM events WHERE type='transport.prompt_override'").get() as { payload: string };
+    expect(JSON.parse(audit.payload)).not.toHaveProperty("input");
+    expect(f.observations).toEqual([]);
   });
 });

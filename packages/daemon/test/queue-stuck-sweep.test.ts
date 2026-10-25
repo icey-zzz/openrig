@@ -104,6 +104,39 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     );
   }
 
+  it("a row whose destination no longer resolves does not stop the other findings, and the pass still reports the failure", async () => {
+    // A historic row addressed to a rig that has since gone: admitted when it was created, refused now.
+    let rigGone = false;
+    repo = new QueueRepository(db, bus, {
+      validateRig: (destination) => !(rigGone && destination.endsWith("@product-team")),
+      loadHumanRegistry: () => ({ ok: true, entities: [] }),
+    });
+    const orphan = await mkRow("dev1-impl@product-team");
+    const valid = await mkRow("worker@r");
+    ageCreated(orphan.qitemId, 130);
+    ageCreated(valid.qitemId, 120);
+    rigGone = true;
+
+    const { status, result } = await runSweep();
+    // The later, unrelated row is still recovered.
+    const created = await findingsFor(valid.qitemId);
+    expect(created).toEqual([expect.objectContaining({ destinationSession: "worker@r", state: "pending" })]);
+    expect(result.findings).toEqual([expect.objectContaining({ qitemId: valid.qitemId, action: "created" })]);
+    // The pass still fails visibly, naming the row it could not route, and counts what it did route.
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain(orphan.qitemId);
+    expect(status.snapshot()).toMatchObject({ lastOutcome: "failed", consecutiveFailures: 1, findingsRouted: 1 });
+    expect(await findingsFor(orphan.qitemId)).toEqual([]);
+    // The orphan row itself is left as it was.
+    expect(repo.getById(orphan.qitemId)).toMatchObject({ state: "pending", destinationSession: "dev1-impl@product-team" });
+
+    // The next pass refreshes the made finding rather than duplicating it, and still reports the failure.
+    const again = (await runSweep()).result;
+    expect(again.outcome).toBe("failed");
+    expect(await findingsFor(valid.qitemId)).toEqual([expect.objectContaining({ qitemId: created[0]!.qitemId })]);
+    expect(again.findings).toEqual([expect.objectContaining({ qitemId: valid.qitemId, action: "refreshed" })]);
+  });
+
   it("OVERDUE HALF: a claimed-never-closed row past closure_required_at yields exactly one finding row to the claimant, evidence inline", async () => {
     const row = await mkRow();
     repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
@@ -261,6 +294,41 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
       state: "done",
       closureReason: "no-follow-on",
     });
+  });
+
+  // A stalled claim's age is the stall's own: minutes since the latest meaningful change, floored as the "why" counts
+  // them. The claim time alone would count time spent parked, and rounding would drift a minute from the "why".
+  function ageTransitions(qitemId: string, minutesAgo: number[]): void {
+    const ids = db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id").all(qitemId) as Array<{ transition_id: number }>;
+    expect(ids).toHaveLength(minutesAgo.length);
+    ids.forEach(({ transition_id }, i) => db.prepare("UPDATE queue_transitions SET ts = ? WHERE transition_id = ?")
+      .run(new Date(Date.now() - minutesAgo[i]! * 60_000).toISOString(), transition_id));
+  }
+
+  it("claimed, parked, resumed, then quiet: the finding's headline and body count minutes since the resume, not since the claim", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "blocked", blockedOn: "external:vendor" } as never);
+    await repo.update({ qitemId: row.qitemId, actorSession: "worker@r", state: "in-progress" } as never);
+    ageClaim(row.qitemId, 77);
+    ageTransitions(row.qitemId, [78, 77, 76, 20]); // created, claimed, parked, resumed
+    expect(repo.getById(row.qitemId)!.pickup?.state).toBe("stalled-after-claim");
+    await runSweep();
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding!.summary).toBe(`Stuck sweep: stalled-after-claim on ${row.qitemId} (20 min)`);
+    expect(finding!.body).toContain("\nage: 20 min\n");
+    expect(finding!.body).toContain("no meaningful queue change for 20 min");
+  });
+
+  it("a stall of 30 min 40 s reads 30 min in the headline, the body and the why alike", async () => {
+    const row = await mkRow();
+    repo.claim({ qitemId: row.qitemId, destinationSession: "worker@r" });
+    ageClaim(row.qitemId, 30 + 40 / 60);
+    await runSweep();
+    const [finding] = await findingsFor(row.qitemId);
+    expect(finding!.summary).toBe(`Stuck sweep: stalled-after-claim on ${row.qitemId} (30 min)`);
+    expect(finding!.body).toContain("\nage: 30 min\n");
+    expect(finding!.body).toMatch(/why: (claimed|no meaningful queue change for) 30 min/);
   });
 
   it("UNDELIVERED HALF: a pending row whose nudge failed yields exactly one finding routed to the destination's orchestrator", async () => {
@@ -976,6 +1044,7 @@ describe("S02 standing stuck sweep — both halves, routed findings, quiet-but-o
     expect(findings[0]!.body).toContain(foreign);
     expect(findings[0]!.body).toMatch(/verification.required|indeterminate/i);
     expect(findings[0]!.body).not.toMatch(/does not exist|dangling/i);
+    expect(findings[0]!.summary).toMatch(new RegExp(`^Custody not checked on host vps-unknown for ${row.qitemId} \\(\\d+ min\\)$`));
   });
 
   it("CUSTODY-VERIFIED DISPOSITION: a durable custody-verified note on the closed row silences the bare-id local miss", async () => {
@@ -1174,7 +1243,7 @@ describe.each(["done", "handed-off"] as const)("#318 seat-target closure without
       state: "pending",
       destinationSession: "worker@r",
     });
-    expect(findings[0]!.summary).toContain("successor-verification-required");
+    expect(findings[0]!.summary).toMatch(new RegExp(`^Custody not checked: no successor of ${row.qitemId} in this store \\(\\d+ min\\)$`));
     expect(findings[0]!.body).toContain("- next@r");
     expect(findings[0]!.body).toContain("OPENRIG_URL=<registered-host> rig queue list --destination next@r");
     expect(findings[0]!.body).toContain("custody-verified: <target>");
@@ -1582,7 +1651,7 @@ describe("#514 unclaimed sweep and a pending ask posted to a registered human", 
 
   async function ask(destinationSession = "human-owner@external"): Promise<QueueItem> {
     return repo.create({ sourceSession: "asker@r", destinationSession, body: "Pick option A or B", summary: "A or B?",
-      evidenceRef: "rig queue show qitem-fixture", humanIntent: "decision" } as never);
+      evidenceRef: "rig queue show qitem-fixture", humanIntent: "decision", humanAlert: true } as never);
   }
   const currentKey = (id: string) => `${id}:${repo.transitionLog.latestOwnerNotificationForQitem(id)!.transitionId}`;
   const receipt = (id: string, kind: "posted" | "transport-failed", key = currentKey(id)) => repo.update({
@@ -1730,9 +1799,21 @@ describe("#514 unclaimed sweep and a pending ask posted to a registered human", 
   const unclaimedFinding = async (qitemId: string) => (await findingsFor(qitemId))
     .filter((f) => (f.tags ?? []).includes(`stuck-sweep:unclaimed-obligation:${qitemId}`));
 
+  it("a row whose wake the seat's level or hold held isn't reported as unclaimed: it's held at the seat, not stuck", async () => {
+    const heldRow = await repo.create({ sourceSession: "asker@r", destinationSession: "worker@r", body: "held at a quiet seat", nudge: false });
+    const draftRow = await repo.create({ sourceSession: "asker@r", destinationSession: "worker@r", body: "held by a draft", nudge: false });
+    repo.recordNudgeAttempt(heldRow.qitemId, "retained:typing_guard");
+    repo.recordNudgeAttempt(draftRow.qitemId, "retained:draft_aware");
+    age(heldRow.qitemId); age(draftRow.qitemId);
+    expect(repo.waitingView(heldRow.qitemId)!.nextBackstop).toMatchObject({ held: true });
+    await sweep();
+    expect(await unclaimedFinding(heldRow.qitemId)).toEqual([]);
+    expect(await unclaimedFinding(draftRow.qitemId)).toHaveLength(1); // a draft can clear: still the sweep's
+  });
+
   it("a registered alias without an intent (owner@kernel) is suppressed like its @external address", async () => {
     const row = await repo.create({ sourceSession: "asker@r", destinationSession: "owner@kernel", body: "Pick option A or B",
-      summary: "A or B?", evidenceRef: "rig queue show qitem-fixture" });
+      summary: "A or B?", evidenceRef: "rig queue show qitem-fixture", humanAlert: true });
     receipt(row.qitemId, "posted");
     age(row.qitemId);
     expect(repo.humanNotificationPostedThisEpisode(row.qitemId)).toBe(true);

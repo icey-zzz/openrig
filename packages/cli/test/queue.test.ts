@@ -419,6 +419,32 @@ describe("rig queue CLI", () => {
     expect(result.detail).toContain("HTTP 503");
   });
 
+  // An ask placed on Steering without an alert owes no Slack post: verification says so at once, never "still pending".
+  it("create --alert sends humanAlert; delivery verification reports an unalerted ask at once, without waiting for a post", async () => {
+    const { deps, calls } = makeDeps();
+    await createProgram({ queueDeps: deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Approve the rollback now?", "--alert", "--json"]);
+    expect(calls.find((c) => c.path === "/api/queue/create")?.body).toMatchObject({ humanAlert: true });
+    const quiet = makeDeps();
+    await createProgram({ queueDeps: quiet.deps }).parseAsync(["node", "rig", "queue", "create", "--destination", "human-founder@external", "--body", "Which name?", "--json"]);
+    expect(quiet.calls.find((c) => c.path === "/api/queue/create")?.body).not.toHaveProperty("humanAlert");
+    const handoff = makeDeps();
+    await createProgram({ queueDeps: handoff.deps }).parseAsync(["node", "rig", "queue", "handoff", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(handoff.calls.find((c) => c.path === "/api/queue/qitem-src/handoff")?.body).toMatchObject({ humanAlert: true });
+    const complete = makeDeps();
+    await createProgram({ queueDeps: complete.deps }).parseAsync(["node", "rig", "queue", "handoff-and-complete", "qitem-src", "--to", "human-founder@external", "--body", "Approve now?", "--alert", "--json"]);
+    expect(complete.calls.find((c) => c.path === "/api/queue/qitem-src/handoff-and-complete")?.body).toMatchObject({ humanAlert: true });
+    let reads = 0;
+    const result = await waitForDeliveryOutcome(
+      { get: async <T>() => { reads += 1; return { status: 200, data: { destinationSession: "human-founder@external", lastNudgeResult: "gateway-owned:slack", ownerNotificationLevel: "RECORD", deliveryOutcome: null } as T }; } },
+      "qitem-steering",
+      { timeoutMs: 60_000, sleep: async () => { throw new Error("waited for a post that isn't owed"); } },
+      { destinationSession: "human-founder@external" },
+    );
+    expect(result).toMatchObject({ receiptSource: "gateway", outcome: "not-alerted", connectorAccepted: null, nextAction: null });
+    expect(result.detail).toMatch(/^created without --alert, and the person's Slack subscription is urgent-only/);
+    expect(reads).toBe(1);
+  });
+
   it("delivery verification reports an unreadable receipt as indeterminate, not rejected", async () => {
     const result = await waitForDeliveryOutcome(
       { get: async () => { throw new Error("daemon read timed out"); } } as never,
@@ -1297,12 +1323,14 @@ describe("rig queue CLI", () => {
       const { deps } = makeDeps({ routes: { "GET /api/queue/whoami?session=bob%40rig&recentLimit=25": { status: 200, data } } });
       const program = createProgram({ queueDeps: deps });
       program.exitOverride();
-      logs.length = 0;
+      logs.length = 0; errors.length = 0;
       await program.parseAsync(["node", "rig", "queue", "whoami", "--session", "bob@rig", ...(json ? ["--json"] : [])]);
       return [...logs];
     };
+    // #1806: plain stdout is the answer alone and parses as JSON; the choice lines are on stderr.
     const plain = await run(false);
-    expect(plain.slice(-4)).toEqual([
+    expect(JSON.parse(plain.join("\n"))).toEqual(data);
+    expect(errors.slice(-4)).toEqual([
       "OpenRig did not choose your current work. Choose the candidate your actual work belongs to.",
       "  1. project alpha · mission release · slice 01-work · /m/release/slices/01-work · from row q-1",
       "  2. no project tag · mission missing · slice 01-work · no folder found (mission missing resolves to 0 directories on this host) · from row q-2",
@@ -1804,10 +1832,11 @@ describe("rig queue CLI", () => {
       expect(printed.bodyTruncated).toBe(true);
       expect(printed.bodyBytes).toBe(1000);
       expect(Array.from(printed.body).length).toBe(512);
-      // marker line on its OWN line, with the honest total byte size
-      expect(logs.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
-      expect(logs.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
-      expect(logs.join("\n")).not.toMatch(/\btruncated\b/i);
+      // #1806: stdout is the record alone and parses as JSON; the marker line, with the honest total byte size, is on stderr
+      expect(JSON.parse(logs.join("\n"))).toMatchObject({ qitemId: "qitem-1", bodyTruncated: true });
+      expect(errors.join("\n")).toContain("bounded preview — complete body is 1000 bytes; full record");
+      expect(errors.join("\n")).toContain("rig queue show 'qitem-1' --full --json");
+      expect(errors.join("\n")).not.toMatch(/\btruncated\b/i);
     });
 
     it("show default: small body → full body, NO marker, bodyTruncated=false", async () => {
@@ -1927,6 +1956,14 @@ describe("rig queue CLI", () => {
       expect(help).toContain("--resolution <text>");
       expect(help).not.toContain("resolution_not_admitted");
       expect(help).not.toContain("resolution_already_closed");
+    });
+
+    it("update --help says how to cancel a row: --state done --closure-reason canceled", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation().replace(/\s+/g, " ");
+      expect(help).toContain("To cancel a row: --state done --closure-reason canceled");
+      expect(help).toContain("--state canceled takes no reason, except 'superseded'");
     });
 
     it("update without --resolution sends no resolution", async () => {

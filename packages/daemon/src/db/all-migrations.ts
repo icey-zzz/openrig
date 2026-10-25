@@ -1,10 +1,18 @@
 import { escalationTargetRefsSchema } from "./migrations/126_escalation_target_refs.js";
+import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_readings.js";
 // The canonical ordered migration list. SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
 
 import { coreSchema } from "./migrations/001_core_schema.js";
+import { terminalPolicySchema } from "./migrations/128_terminal_policy.js";
+import { streamDispositionsSchema } from "./migrations/129_stream_dispositions.js";
+import { streamSubscriptionsSchema } from "./migrations/130_stream_subscriptions.js";
+import { streamRetentionFloorSchema } from "./migrations/131_stream_retention_floor.js";
+import { seatRuntimeSwitchesSchema } from "./migrations/132_seat_runtime_switches.js";
+import { streamReaderActionsSchema } from "./migrations/133_stream_reader_actions.js";
+import { seatIdentityProcessEvidenceSchema } from "./migrations/135_seat_identity_process_evidence.js";
 import { bindingsSessionsSchema } from "./migrations/002_bindings_sessions.js";
 import { eventsSchema } from "./migrations/003_events.js";
 import { snapshotsSchema } from "./migrations/004_snapshots.js";
@@ -127,6 +135,7 @@ import { humanOperatingModesSchema } from "./migrations/122_human_operating_mode
 import { queueDelegatedDecisionSchema } from "./migrations/123_queue_delegated_decision.js";
 import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_watchdog_units.js";
 import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
+import { operationCorrelationSchema } from "./migrations/127_operation_correlation.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -253,4 +262,13 @@ export const ALL_MIGRATIONS: Migration[] = [
   contextUsageWatchdogUnitsSchema,
   nodeAdvisorSchema,
   escalationTargetRefsSchema,
+  operationCorrelationSchema,
+  terminalPolicySchema,
+  streamDispositionsSchema,
+  streamSubscriptionsSchema,
+  streamRetentionFloorSchema,
+  seatRuntimeSwitchesSchema,
+  streamReaderActionsSchema,
+  claudeTokenReadingsSchema,
+  seatIdentityProcessEvidenceSchema,
 ];

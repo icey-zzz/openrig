@@ -27,7 +27,7 @@ import { formatHumanAnswers, unansweredQuestions } from "../src/domain/human-que
 
 const human = "human-founder@external";
 const registry = { ok: true as const, entities: [{ entityId: "human-founder", class: "human" as const, displayName: "Founder", address: human, connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "UFOUNDER" }], prefs: { deliveryClass: "A" as const } }] };
-const request = { sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
+const request = { humanAlert: true, sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
 const questions = [
   { id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres", recommended: true }, { id: "sqlite", label: "SQLite" }] },
   { id: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] },
@@ -384,8 +384,8 @@ describe("structured human questions (#193)", () => {
       await click("ship", "yes", { actionTs: "2001.1" }); // a real late click
       await click("ship", "yes", { actionTs: "2001.1" }); // and its redelivery
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(3));
-      expect(threadAcks()[2]).toBe(CLICK_REPLIES.closed);
-      expect(threadAcks().filter((t) => t === CLICK_REPLIES.closed)).toHaveLength(1);
+      expect(threadAcks()[2]).toContain("Already answered; the original answer went to author@rig as ");
+      expect(threadAcks().filter((t) => t.startsWith("Already answered"))).toHaveLength(1);
       expect(repliesToSeat()).toHaveLength(1);
     });
 
@@ -442,7 +442,7 @@ describe("structured human questions (#193)", () => {
       expect(threadAcks()).toHaveLength(1);
       await click("ship", "yes", { actionTs: "2200.1" }); // Socket Mode redelivery of that click
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(2));
-      expect(threadAcks()[1]).toBe(CLICK_REPLIES.onRecord);
+      expect(threadAcks()[1]).toContain("Already answered; the original answer went to author@rig as ");
       await click("ship", "yes", { actionTs: "2200.1" }); // and once posted, never again
       expect(threadAcks()).toHaveLength(2);
       expect(repliesToSeat()).toHaveLength(1);

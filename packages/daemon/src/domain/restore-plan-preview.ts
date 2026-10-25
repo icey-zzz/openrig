@@ -16,7 +16,10 @@ import { resolveActiveSnapshotSession, deriveRehydrateOccupantsByNode, deriveReh
 import type { RigWithRelations, Snapshot } from "./types.js";
 import { readFreshOccupantRelations } from "./fresh-occupant-relation.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
-import { effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts } from "./restore-policy.js";
+import { communityLaunchOnlyRestoreReason, effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts } from "./restore-policy.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { communityHarnessStopsRestore } from "./community-harness-presets.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
 import { assessSnapshotCurrentOccupants, stoppedSnapshotReason } from "./rehydrate-eligibility.js";
 
 /** OPR.0.4.3.20 FR-6 — a present token whose last verification is older than this
@@ -32,8 +35,9 @@ export interface RestorePlanPreviewNode {
   /** Consent version, not a guessed native conversation id. */
   occupantSessionId?: string | null;
   hasHistory?: boolean;
-  /** The slice-02 vocabulary, as a forecast: what apply mode WOULD do. */
-  intendedAction: "resume-original" | "fresh-primed" | "awaiting-decision";
+  /** The slice-02 vocabulary, as a forecast: what apply mode WOULD do. `leave-attached`: a seat joined with `rig attach` as
+   *  an external CLI, which restore leaves as it is (its result is `left_attached`). */
+  intendedAction: "resume-original" | "fresh-primed" | "awaiting-decision" | "leave-attached";
   reason?: string;
   // OPR.0.4.3.20 FR-6 — per-seat token state + freshness (read-only forecast).
   /** present = verified + fresh; missing = no token; stale = probe failed OR
@@ -76,6 +80,8 @@ export interface PreviewSessionRow {
   restorePolicy: string | null;
   resumeType: string | null;
   resumeToken: string | null;
+  /** The community harness the session was launched for, if any (its preset is launch-only at restore). */
+  communityHarness?: string | null;
   // OPR.0.4.3.20 FR-6 — provenance + verification freshness (nullable/degrading
   // for pre-45 rows and old snapshots → rendered as unverified, never a crash).
   resumeProvenance?: string | null;
@@ -129,6 +135,12 @@ function runtimePromptFor(runtime: string | null, tokenState: ResumeTokenState):
   return undefined;
 }
 
+/** Why restore leaves a seat joined with `rig attach` as an external CLI as it is: said by its result and by this forecast. */
+export function leftAttachedReason(name: string): string {
+  return `${name} is joined with rig attach as an external CLI, so restore leaves it attached: nothing is launched in its place, and OpenRig `
+    + `can't see whether that app is still running. To run this seat under OpenRig instead, release it with: rig unclaim ${name}, then launch it.`;
+}
+
 /** Forecast one seat's restore action — mirrors the orchestrator's pre-launch
  *  classification (OPR.0.3.4.2) without touching anything. A fresh-listed
  *  seat (operation B, `--fresh <seat>`) forecasts `fresh-primed` BEFORE any
@@ -166,6 +178,13 @@ function intendedActionFor(
   }
   const occupant = resolution.kind === "resolved" ? resolution.session : null;
   const policy = effectiveRestorePolicy(seat, occupant?.restorePolicy);
+  // As apply: a launch-only community harness (its preset declares no resume) forecasts a decision, not a resume.
+  // The snapshot's saved runtime, as apply reads it.
+  const savedRuntime = seat.savedRuntime ?? seat.currentRuntime;
+  if (policy === "resume_if_possible" && occupant && communityHarnessOf(occupant.communityHarness, savedRuntime)
+    && communityHarnessStopsRestore(savedRuntime, occupant.resumeType, occupant.resumeToken)) {
+    return { intendedAction: "awaiting-decision", reason: communityLaunchOnlyRestoreReason(savedRuntime, absentHistory.logicalId, absentHistory.rigName) };
+  }
   const sourceRecorded = !!occupant?.resumeType && occupant.resumeType !== "none";
   if (policy === "resume_if_possible" && sourceRecorded && occupant?.resumeToken) {
     return { intendedAction: "resume-original" };
@@ -197,6 +216,7 @@ export function collectPreviewSessionRows(
       restorePolicy: s.restorePolicy ?? null,
       resumeType: s.resumeType ?? null,
       resumeToken: s.resumeToken ?? null,
+      communityHarness: s.communityHarness ?? null,
       // OPR.0.4.3.20 FR-6 — degrade to null for snapshots serialized pre-45.
       resumeProvenance: s.resumeProvenance ?? null,
       resumeLastVerified: s.resumeLastVerified ?? null,
@@ -209,13 +229,14 @@ export function collectPreviewSessionRows(
   if (nodeIds.length === 0) return [];
   const placeholders = nodeIds.map(() => "?").join(",");
   const rows = db.prepare(
-    `SELECT id, node_id, restore_policy, resume_type, resume_token, resume_provenance, resume_last_verified, resume_last_probe_status, status FROM sessions WHERE node_id IN (${placeholders})`
-  ).all(...nodeIds) as Array<{ id: string; node_id: string; restore_policy: string | null; resume_type: string | null; resume_token: string | null; resume_provenance: string | null; resume_last_verified: string | null; resume_last_probe_status: string | null; status: string | null }>;
+    `SELECT s.id, s.node_id, s.restore_policy, s.resume_type, s.resume_token, s.resume_provenance, s.resume_last_verified, s.resume_last_probe_status, s.status, ${sessionCommunityHarnessSelect(db)} AS community_harness FROM sessions s WHERE s.node_id IN (${placeholders})`
+  ).all(...nodeIds) as Array<{ id: string; node_id: string; restore_policy: string | null; resume_type: string | null; resume_token: string | null; resume_provenance: string | null; resume_last_verified: string | null; resume_last_probe_status: string | null; status: string | null; community_harness: string | null }>;
   const sessions = rows.map((r) => ({
     nodeId: r.node_id,
     restorePolicy: r.restore_policy,
     resumeType: r.resume_type,
     resumeToken: r.resume_token,
+    communityHarness: r.community_harness,
     resumeProvenance: r.resume_provenance,
     resumeLastVerified: r.resume_last_verified,
     resumeLastProbeStatus: r.resume_last_probe_status,
@@ -270,7 +291,11 @@ export function buildRestorePlanPreview(
       recordedSessions: sessionRows.filter((row) => row.nodeId === savedNodeId),
     };
     const stoppedCurrent = sessionRows.some(row => row.nodeId === savedNodeId && row.stoppedCurrent);
-    const { intendedAction, reason } = runtimeError
+    // Restore checks the live binding before anything else (restoreNodeWithCompensation), and so does its forecast.
+    const attached = node.binding?.attachmentType === "external_cli";
+    const { intendedAction, reason } = attached
+      ? { intendedAction: "leave-attached" as const, reason: leftAttachedReason(node.binding?.externalSessionName ?? node.logicalId) }
+      : runtimeError
       ? { intendedAction: "awaiting-decision" as const, reason: runtimeError }
       : intendedActionFor(resolution, freshRequested, seat,
         { logicalId: node.logicalId, rigName: rig.rig.name, row: absentSeatResumeHistory(sessionRows, savedNodeId), stoppedCurrent });
@@ -278,7 +303,7 @@ export function buildRestorePlanPreview(
     // RESOLVED occupant only — never from a historical row.
     const occupant = resolution.kind === "resolved" ? resolution.session : null;
     const { tokenState, provenance, lastVerified } = tokenStateFor(occupant, nowMs);
-    const runtimePrompt = runtimePromptFor(node.runtime, tokenState);
+    const runtimePrompt = attached ? undefined : runtimePromptFor(node.runtime, tokenState);
     return {
       logicalId: node.logicalId,
       occupantSessionId: occupant?.id ?? null,
@@ -292,7 +317,7 @@ export function buildRestorePlanPreview(
       // silent); runtime mismatches and broken relations cannot be resolved
       // by a fresh request, so --fresh must not be suggested as their remedy.
       // A terminal has no token to find and relaunches fresh on its own.
-      freshRequired: stoppedCurrent || runtimeError || resolution.kind === "ambiguous" ? false : tokenState === "missing" && !isOrdinaryTerminalSeat(seat),
+      freshRequired: attached || stoppedCurrent || runtimeError || resolution.kind === "ambiguous" ? false : tokenState === "missing" && !isOrdinaryTerminalSeat(seat),
       ...(runtimePrompt ? { runtimePrompt } : {}),
     };
   });

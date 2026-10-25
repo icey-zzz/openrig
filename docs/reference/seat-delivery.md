@@ -12,10 +12,81 @@ daemon-owned retry scheduler. Sibling seats keep their own mode.
 | `hold` | No automatic terminal input, even at an empty prompt | Retain for inspection outside the pane |
 
 Runtime permissions are separate. Recipient and interactive-prompt checks still
-apply. `--raw`, `--force` and `--dangerously-interact` do not bypass the typing guard.
-Direct human input remains available.
+apply. `--raw` and `--force` do not bypass the typing guard. A deliberate
+`--dangerously-interact --reason` remains available at every interruption level
+and uses the existing-input check below. Direct human input remains available.
 
 ## Configure and inspect
+
+### Who may intervene
+
+`rig seat status <seat>` shows the seat's terminal interaction account alongside
+its native permissions and interruption level. These choices are independent.
+The presets `no-peer-interventions`, `help-within-instructions` and `full-control`
+set the peer row. Self and OpenRig retain their existing authority unless an
+explicit exception changes it. Named helpers and the delegating instruction are
+shown; OpenRig does not interpret free-text instructions as executable rules.
+
+~~~sh
+rig seat set-terminal-policy reviewer@my-rig --preset help-within-instructions \
+  --helper lead@my-rig --peer-model deny \
+  --reason "Help with compaction; keep the review model"
+rig seat status reviewer@my-rig
+~~~
+
+Each `--peer-compaction`, `--self-compaction`, `--openrig-compaction`,
+`--peer-model`, `--self-model` or `--openrig-model` exception takes `allow` or
+`deny`. Model includes reasoning effort. Exceptions apply to the whole actor
+row: `--peer-compaction allow` also allows unnamed peers. A choice with
+exceptions reads as Custom. The setter replaces the complete choice; omit
+exceptions to return to the preset's defaults. Outside a managed seat, use `--operator <address>` for
+audit attribution. This does not establish an authenticated identity.
+
+Enforcement covers managed compaction and saved model/effort changes only.
+The latter take effect at the next managed continuation, not in the current
+process. Other interventions remain guidance-only. Managed compaction applies
+to Claude seats; it is not offered for Codex or Pi. A policy change during
+preparation is checked before further input. It does not undo a submitted
+`/compact` or abandon an already-owed restore/audit.
+
+Existing seats retain current behaviour on upgrade. To choose a default for
+newly added seats in a rig, add `--rig-default` to the setter above: existing
+seats keep their own copied choices. OpenRig's standing managed-compaction
+authority stays active unless its exception is deliberately changed.
+
+Caller attribution is cooperative. An unattributed caller retains current
+behaviour rather than being labelled the person or a peer. The existing
+`rig send --dangerously-interact --reason` path remains available; this policy
+adds no restriction there. Its existing-input check applies independently of the
+typing mode. Plain tmux is not prevented.
+
+### Deliberate interaction and existing input
+
+A managed `rig send <seat> "<answer>" --dangerously-interact --reason "<why>" can
+drive a recognized native menu as before. Otherwise, with the delivery guard
+attached, it reads the visible composer under the seat's lease immediately before
+pasting, after buffer preparation. Empty input proceeds. A recognized dim
+suggestion is displayed separately and counts as empty; typed or pasted text
+(author unknown) stops the send with `override_input_present`. An unreadable input
+stops with `override_input_unknown`, never an empty-input claim. Both return single-send HTTP
+409, `sent: false`, and caller-only `existingInput` evidence (visible rows, suggestion
+rows, cursor/dimensions and target binding). A collapsed paste shows its label,
+not the hidden contents. OpenRig neither holds nor retries this stopped override.
+
+Inspect the shown input in the native terminal, deliberately clear the prompt with
+native/tmux controls, then issue the send again. Manual clearing runs outside
+OpenRig's lease and observation checks and is not recorded. For a deliberate
+unchecked write, add `--type-without-checking` to that same command. It skips the
+read and does **not** clear input: the text may join or submit what is already there.
+The result names that choice. It requires `--dangerously-interact` and `--reason`.
+
+Observed input is returned only to the caller, never saved in an outbox, held
+message, capture-observer record or override audit. The audit keeps classifications,
+counts and the choice, without input contents. The lease serializes OpenRig writes;
+human typing can still race the capture and paste. Ordinary sends and wakes keep
+their existing behaviour.
+
+### Terminal delivery
 
 Run from a seat shell with `OPENRIG_SESSION_NAME` set; the daemon derives the
 audit actor from transport identity.
@@ -159,6 +230,9 @@ current parked-row eligibility and stop checks still apply. This changes message
 structured continuity actions such as creating a cutover baton.
 
 The parked-owner supervisor also retries current obligations despite an earlier failed, unknown or unrecorded attempt.
+Its first reminder to a seat waits until the seat's waiting state has been unchanged for 5 minutes, then goes on the next
+watchdog tick, so a seat that just handed work off or asked a person isn't interrupted; a seat still holding the work after
+that is reminded as before. A seat at an approval or question prompt gets no grace, so the prompt-blocked alert isn't delayed.
 A recorded success to the same known occupant waits for a change in its obligations. Rotation includes retained attempts,
 so a held input cannot starve another owner. Interactive prompts stay with the existing prompt-refusal recovery.
 Its own reminders wait while managed compaction owes the turn boundary, restore or audit, including a fresh check

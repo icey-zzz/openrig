@@ -5,6 +5,7 @@ import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
 import { renderScreen } from "../src/render.js";
 import { createViewState } from "../src/state.js";
+import { rowStatusGlyph, statusGlyph } from "../src/topology/glyphs.js";
 
 // Fixtures mirror the SERVED shapes traced firsthand at 5f3b5bd4 (Phase-2
 // endpoint-shape survey): real field names, real enum values, real evidence
@@ -203,6 +204,42 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
       records: [{ id: "health-context-dev-impl", scope: { seatId: "01JNODEIMPL" } }],
     });
     expect(snap.hosts[0]?.rigs[0]?.pods[0]?.agents[0]).toMatchObject({ nodeId: "01JNODEIMPL" });
+  });
+  it("shows attention as unknown when an older daemon omits the seat flag", async () => {
+    const snap = await hydrateSnapshot(fixtureClient());
+    expect(snap.hosts[0]!.rigs[0]!.pods[0]!.agents[0]!.needsAttention).toBeNull();
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "host", name: snap.hosts[0]!.name });
+    const output = renderScreen(view.get(), snap, { cols: 160, rows: 60 });
+    expect(output.lines.join("\n")).toContain("attention unknown");
+  });
+  it.each([
+    { agentActivity: { state: "needs_input" }, startupStatus: "ready" as const, status: "needs_input" },
+    { agentActivity: null, startupStatus: "attention_required" as const, status: "attention_required" },
+  ])("keeps an older daemon's $status visible in rows and graph", async ({ status, ...fields }) => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": [{ ...base, ...fields }] }));
+    const agent = snap.hosts[0]!.rigs[0]!.pods[0]!.agents[0]!;
+    expect(agent.needsAttention).toBeNull();
+    expect(agent.status).toBe(status);
+    expect(rowStatusGlyph(agent).glyph).toBe("◐");
+    const graph = { logicalId: agent.name, runtime: agent.runtime, model: null, nodeKind: "agent" as const,
+      contextUsedPercentage: null, status: "running", ...fields };
+    expect(statusGlyph(graph).glyph).toBe("◐");
+    expect(statusGlyph({ ...graph, needsAttention: false }).glyph).not.toBe("◐");
+  });
+  it.each([
+    ["runtime_hook", "hook"], ["pane_heuristic", "pane"], [undefined, "unknown"],
+  ])("shows a raw prompt as needs_input with %s evidence labelled %s", async (evidenceSource, label) => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": [{ ...base,
+      needsAttention: true, arbitratedNeedsInput: null, agentActivity: { state: "needs_input", evidenceSource },
+    }] }));
+    const agent = snap.hosts[0]!.rigs[0]!.pods[0]!.agents[0]!;
+    expect(agent.status).toBe("needs_input");
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch({ type: "drill", resource: "agent", name: agent.name, target: { host: "mm2-openrig1", rig: "myrig" } });
+    expect(renderScreen(view.get(), snap, { cols: 180, rows: 60 }).lines.join("\n")).toContain(`needs-input evidence ${label}`);
   });
   it("leaves health unassessed when a focused view skips the projection read", async () => {
     const context = { section: "topology" as const, viewTab: "table" as const, drill: [] };
@@ -506,8 +543,8 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
 
     const nodes = [
       { ...base, logicalId: "dev.failed", startupStatus: "failed", lifecycleState: "attention_required", terminalActive: true },
-      { ...base, logicalId: "dev.attention", startupStatus: "attention_required", lifecycleState: "attention_required", terminalActive: false },
-      { ...base, logicalId: "dev.input", startupStatus: "ready", agentActivity: { state: "needs_input" }, terminalActive: true },
+      { ...base, logicalId: "dev.attention", needsAttention: true, startupStatus: "attention_required", lifecycleState: "attention_required", terminalActive: false },
+      { ...base, logicalId: "dev.input", needsAttention: true, arbitratedNeedsInput: true, startupStatus: "ready", agentActivity: { state: "needs_input" }, terminalActive: true },
       { ...base, logicalId: "dev.active", startupStatus: "ready", agentActivity: { state: "running" }, terminalActive: true },
       { ...base, logicalId: "dev.mismatch", startupStatus: "ready", lifecycleState: "attention_required", agentActivity: { state: "running" }, terminalActive: true, identityVerdict: { verdict: "mismatch" } },
       { ...base, logicalId: "dev.missing", startupStatus: "ready", lifecycleState: "attention_required", agentActivity: { state: "running" }, terminalActive: true, identityVerdict: { verdict: "pane_missing" } },
@@ -538,7 +575,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     const nodes = [
       { ...base, ...quiet, logicalId: "dev.app-quiet", runtime: "synth-harness", communityHarness: { harness: "synth-harness" } },
       { ...base, ...quiet, logicalId: "dev.app-moving", runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, terminalActive: true },
-      { ...base, ...quiet, logicalId: "dev.app-prompt", runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, agentActivity: { state: "needs_input" } },
+      { ...base, ...quiet, logicalId: "dev.app-prompt", needsAttention: true, arbitratedNeedsInput: null, runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, agentActivity: { state: "needs_input" } },
       { ...base, ...quiet, logicalId: "dev.pi-quiet", runtime: "pi" },
       { ...base, ...quiet, logicalId: "dev.claude-quiet", runtime: "claude-code" },
     ];
@@ -568,6 +605,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
       {
         ...base,
         logicalId: "dev.missing-attention",
+        needsAttention: true,
         sessionStatus: "detached",
         startupStatus: "attention_required",
         lifecycleState: "attention_required",

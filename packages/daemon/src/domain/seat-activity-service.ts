@@ -415,6 +415,22 @@ export class SeatActivityService {
     if (claude && evidence.permissionRequest) void this.pollPermissionPrompt(seat.sessionName).catch(() => {});
   }
 
+  /** A person attested that the prompt this seat waited on is gone (`clear-attention --reason`): settle it here as a
+   *  resolving hook does, so the oracle, the wake ladder and the inventory agree with the cleared hook. A new permission
+   *  hook starts a new request, and each send still reads the pane. */
+  settlePermissionPrompt(sessionName: string): void {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired) return;
+    seat.permissions.clear();
+    seat.permissionObservedAt = null;
+    seat.sources.delete(`${seat.inventory?.runtime ?? "codex"}:permission-prompt`);
+    for (const source of seat.sources.values()) {
+      if (source.latest.needsInput?.count) source.latest = { ...source.latest, needsInput: undefined };
+    }
+    this.arbitrate(seat);
+  }
+
   /** A handover/generation swap: its OWN visible event, never an activity transition.
    *  Evidence, debounce, contradiction and promotion state are cleared; every known
    *  rung's trust drops to `absent` until the successor's adapter RE-DECLARES its
@@ -610,6 +626,11 @@ export class SeatActivityService {
       if (rung === "lifecycle-hooks" && !(this.durableBoundaries(seat, rung) && (evd.activity !== "working"
           || (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) > 0))
           && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      // An idle boundary whose source promised to keep reporting holds for two reports. A source that goes quiet (a runner
+      // killed or out of memory) stops reading idle, but only when nothing is waiting on a person: attention holds.
+      if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
+          && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
+          && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
       return evd;
     }
     return null;

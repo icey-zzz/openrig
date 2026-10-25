@@ -529,6 +529,7 @@ Examples:
       console.log(`  fragment: ${r.fragmentPath}`);
       console.log(`  delivery-class: ${r.prefs.deliveryClass.value} (${r.prefs.deliveryClass.source})`);
       console.log(`  away: ${r.prefs.away.value} (${r.prefs.away.source})`);
+      console.log(`  slack-subscription: ${r.slackSubscription.value} (${r.slackSubscription.source})`);
       r.connectorBindings.forEach((b, i) => {
         console.log(`  binding.${i}: ${b.kind}:${b.connectorRef} role=${b.role}${b.handle ? ` handle=${b.handle}` : " [outbound-only]"}`);
       });
@@ -538,7 +539,7 @@ Examples:
 
   human
     .command("set <entityId> <field> <value>")
-    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), binding.<n>")
+    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (the person's Slack subscription: every-ask, the default, posts every ask to Slack too; urgent-only posts only asks created with --alert, the rest wait on Steering and the TUI; or unset), binding.<n>")
     .option("--reason <reason>", "Reason recorded with connector binding changes", "update human binding")
     .option("--actor <actor>", "Named operator when outside a managed seat")
     .action(async (entityId: string, field: string, value: string, opts: { reason: string; actor?: string }) => {

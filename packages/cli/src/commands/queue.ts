@@ -51,7 +51,8 @@ interface DeliveryResultBase {
 /** The gateway (Slack connector) owns delivery; its ledger is the receipt. */
 export interface GatewayDeliveryResult extends DeliveryResultBase {
   receiptSource: "gateway";
-  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate";
+  /** not-alerted: an ask created without --alert to a person whose Slack subscription is urgent-only, so it's on Steering and the TUI and never sent to Slack. */
+  outcome: "posted" | "transport-failed" | "never-posted" | "still-pending" | "indeterminate" | "not-alerted";
   /** null means no receipt can presently settle connector acceptance. */
   connectorAccepted: boolean | null;
   /** #96: present for a --reply-to update once posted; false = it posted top-level instead. */
@@ -106,7 +107,8 @@ function receiptSourceOf(destination: string | null, row: QueueRow): "gateway" |
  *  with a pane): the row carries the owner notification level the Slack selector keys on, or a
  *  gateway receipt already exists. */
 function gatewayAlsoPosts(row: QueueRow): boolean {
-  return stringField(row, "ownerNotificationLevel") !== null || stringField(row, "deliveryOutcome") !== null;
+  const level = stringField(row, "ownerNotificationLevel");
+  return (level !== null && level !== "RECORD") || stringField(row, "deliveryOutcome") !== null;
 }
 
 /** A terminal destination is a person when the gateway also posts to it or its address is a human seat's. */
@@ -241,6 +243,11 @@ export async function waitForDeliveryOutcome(
     if (receiptSourceOf(destination, row) === "gateway") {
       const outcome = row.deliveryOutcome;
       const gateway = { receiptSource: "gateway" as const, destinationKind: "human" as const, humanReadership: "unknown" as const };
+      // An ask placed on Steering without an alert owes no post, so there's no receipt to wait for.
+      if (outcome == null && stringField(row, "ownerNotificationLevel") === "RECORD") {
+        return { ...gateway, outcome: "not-alerted", connectorAccepted: null,
+          detail: "created without --alert, and the person's Slack subscription is urgent-only, so it's not sent there; it's on Steering and the TUI for them", nextAction: null };
+      }
       if (outcome === "posted") {
         // #96: a --reply-to update reports whether it joined the earlier item's thread.
         const replyTo = stringField(row, "replyTo");
@@ -325,7 +332,8 @@ async function withClient<T>(
       // render owns the 3-part fact/consequence/action + the io exit (response-integrity
       // contract). One render authority, layered context — never a swallowed exit.
       const where = hostContext ? ` (routing to host '${hostContext}')` : "";
-      console.error(`queue transport failure${where}: ${err.message}`);
+      const what = err instanceof DaemonTimeoutError ? "queue request got no answer in time" : "queue transport failure";
+      console.error(`${what}${where}: ${err.message}`);
       console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
     }
     throw err;
@@ -401,21 +409,22 @@ interface WorkChoiceCandidate {
 
 /** After the plain answer, the candidates the agent must choose between, one line each, so a
  *  refused current work is never just a count. Prints nothing when the daemon sent no choice
- *  (current work is settled, nothing is in progress, or the daemon predates the field). */
+ *  (current work is settled, nothing is in progress, or the daemon predates the field).
+ *  On stderr, so the answer on stdout still parses as JSON. */
 export function printCurrentWorkChoice(data: unknown): void {
   const choice = (data as { currentWorkChoice?: { instruction?: string; candidates?: WorkChoiceCandidate[];
     unknown?: Array<{ qitemId?: string | null; reason?: string }> } } | null)?.currentWorkChoice;
   if (!choice) return;
-  console.log("");
-  console.log(choice.instruction ?? "OpenRig did not choose your current work.");
+  console.error("");
+  console.error(choice.instruction ?? "OpenRig did not choose your current work.");
   for (const [index, c] of (choice.candidates ?? []).entries()) {
     const project = c.projects?.length ? `project ${c.projects.join(", ")}` : "no project tag";
     const where = c.workNodePath ?? "no folder found";
     const why = c.unresolved ? ` (${c.unresolved})` : "";
-    console.log(`  ${index + 1}. ${project} · mission ${c.mission ?? "?"} · slice ${c.slice ?? "none"} · ${where}${why} · from row ${c.qitemId ?? "unknown"}`);
+    console.error(`  ${index + 1}. ${project} · mission ${c.mission ?? "?"} · slice ${c.slice ?? "none"} · ${where}${why} · from row ${c.qitemId ?? "unknown"}`);
   }
   for (const u of choice.unknown ?? []) {
-    console.log(`  - row ${u.qitemId ?? "unknown"}: work not named (${u.reason ?? "no reason given"})`);
+    console.error(`  - row ${u.qitemId ?? "unknown"}: work not named (${u.reason ?? "no reason given"})`);
   }
 }
 
@@ -430,6 +439,15 @@ function writeReceipt(full: boolean | undefined, ctx: ReceiptContext): ReceiptCo
  *  equals the selected daemon's own host id is settled by {@link settleReceiptHost}. */
 function remoteHostOf(hostId: string | undefined): string | undefined {
   return hostId && hostId !== "local" ? hostId : undefined;
+}
+
+/** A cross-host queue write waits for the selected daemon's own answer. That daemon gives the remote 10 s
+ *  (`QUEUE_FORWARD_TIMEOUT_MS` in the daemon's routes/queue.ts), so waiting only the client's 5 s default
+ *  turns a slow remote's answer into an unknown outcome. */
+const CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS = 15_000;
+
+function crossHostWriteOptions(hostId: string | undefined): { timeoutMs: number } | undefined {
+  return remoteHostOf(hostId) ? { timeoutMs: CROSS_HOST_QUEUE_WRITE_TIMEOUT_MS } : undefined;
 }
 
 /** The daemon's own rule (`resolvesToLocalHost`): a `--host` naming the selected
@@ -759,6 +777,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--target-repo <name>", "PL-007: typed repo scope (must match a repo in the source rig's RigSpec.workspace.repos[])")
     .option("--summary <text>", "Short human-readable subject of the row, shown on every surface that lists it (RECENT, the story, the needs-you view). Say what the work is and why it needs this seat. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
     .option("--human-intent <intent>", "decision (default) or update: a quiet informational delivery, never an approval request")
+    .option("--alert", "For an ask to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the ask still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--human-detail-file <path>", "One explicitly authored supplemental thread reply; keep the complete action/options in --body-file")
     .option("--reply-to <qitemId>", "Post this update into an earlier qitem's Slack thread (requires --human-intent update; posts as a new top-level message instead if that thread can't be used, e.g. it is missing or still has an open human decision; --verify reports why)")
     .option("--human-questions-file <path>", "#193: JSON array of 1-4 questions for a decision, each {id, question, options: [{id, label, recommended?}]} with 2-4 options; Slack shows them as buttons")
@@ -784,6 +803,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       id?: string;
       targetRepo?: string;
       humanIntent?: string;
+      alert?: boolean;
       humanDetailFile?: string;
       replyTo?: string;
       humanQuestionsFile?: string;
@@ -923,6 +943,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           destinationSession: hostResolved.destination,
           body: resolvedBody,
           humanIntent: opts.humanIntent,
+          ...(opts.alert ? { humanAlert: true } : {}),
           humanDetail: opts.humanDetailFile ? await resolveQueueBody({ bodyFile: opts.humanDetailFile }) : undefined,
           replyTo: opts.replyTo,
           humanQuestions,
@@ -937,7 +958,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (omitted for
           // plain local writes — the local path stays byte-identical).
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        }).catch((error: unknown) => {
+        }, crossHostWriteOptions(hostResolved.hostId)).catch((error: unknown) => {
           // A pre-header disconnect can follow a committed create. Preserve the
           // typed error, but do not let the shared renderer assert nondelivery.
           if (error instanceof DaemonConnectionError) error.writeOutcome = "unknown";
@@ -1014,18 +1035,18 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
 
   cmd
     .command("update <qitemId>")
-    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
+    .description("Append a note and/or mutate qitem state. A note without --state never changes row state. state=done REQUIRES --closure-reason (one of: handed_off_to, denied, canceled, no-follow-on, escalation, superseded). To cancel a row: --state done --closure-reason canceled. To wait for another qitem, use rig queue block <id> --on <child>. Closure ≠ acceptance: handed_off_to records delivery to the next stage; acceptance is the next stage's verdict on its own qitem, not this closure.")
     .option("--actor <session>", "(deprecated, ignored) the actor is derived from the seat env (X-OpenRig-Session); P21 I3 made the update route derive it from the transport header")
     .option("--state <state>", "New state: pending | in-progress | done | blocked | failed | denied | canceled | handed-off")
     .option("--reopen", "Explicitly acknowledge a deliberate terminal-to-active repair; requires --state and --note")
-    .option("--closure-reason <reason>", "Required for state=done; also 'superseded' on state=canceled (with --closure-target = the successor) records a supersession, distinct from an abandoned cancel")
+    .option("--closure-reason <reason>", "Required for state=done. --state canceled takes no reason, except 'superseded' (with --closure-target = the successor), which records a supersession, distinct from an abandoned cancel")
     .option("--closure-target <target>", "Required for handed_off_to, escalation, and superseded; blocked_on park records use state=blocked with --blocked-on")
     .option("--resolution <text>", "The outcome, stored on the row and shown by rig queue show. Needs --state done, canceled, denied, failed or handed-off, and non-blank text. Stored when the update closes an open row, after anything the row already has (a fallback line, an earlier outcome); a row that is already closed keeps what it has")
     .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'")
     .option("--wake-watchdog <jobId>", "For state=blocked: attach an existing live watchdog id targeting the row owner")
     .option("--wake-after <duration>", "For state=blocked: atomically arm a timer (for example 90s, 15m, 2h)", wakeDurationSeconds)
     .option("--summary <text>", "Summary persisted onto the item (human-seat parks, or standalone summary update without --state)")
-    .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-6: park-time durable-artifact pointer persisted onto the item (human-seat parks only)")
+    .option("--evidence-ref <path>", "Pointer to the durable artifact, persisted onto the item on a human-seat park or a done close (--state done)")
     .option("--note <text>", "Transition note for the audit log")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
     .option("--json", "JSON output for agents")
@@ -1201,6 +1222,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
     .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
@@ -1218,6 +1240,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
@@ -1269,6 +1292,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
@@ -1276,7 +1300,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
+        }, crossHostWriteOptions(hostResolved.hostId));
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
@@ -1302,6 +1326,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--target-repo <name>", "PL-007: typed repo scope for the new qitem")
     .option("--summary <text>", "OPR.0.4.1.18: short human-readable 1-2 sentence subject of the new qitem — what it is and why this seat — shown on every surface that lists it (RECENT, the story, the needs-you view); --body stays source of truth. Not inherited from the source row. Warned-if-missing.")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
+    .option("--alert", "For a handoff to a person that's urgent: something only they can do, or an approval whose wait costs now. It stands out in Slack (an interrupt with a mention). Without it the item still posts to Slack for a person on the default Slack subscription (every-ask), and waits on Steering and the TUI for one on urgent-only")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
     .option("--full", "Print the whole response row(s) as today, even when output.compact is on (the receipt's waiting keeps only blocker and nextBackstop)")
@@ -1319,6 +1344,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       targetRepo?: string;
       summary?: string;
       evidenceRef?: string;
+      alert?: boolean;
       host?: string;
       nudge?: boolean;
       json?: boolean;
@@ -1368,6 +1394,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           body: resolvedBody,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
+          ...(opts.alert ? { humanAlert: true } : {}),
           transitionNote: opts.note,
           priority: opts.priority,
           tier: opts.tier,
@@ -1375,7 +1402,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           targetRepo: opts.targetRepo,
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
-        });
+        }, crossHostWriteOptions(hostResolved.hostId));
         const hint = hostSubstitutionHint(res.status, res.data, opts.to, opts.host, hostResolved);
         if (hint) console.error(hint);
         await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status, writeReceipt(opts.full, {
@@ -1459,13 +1486,11 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
         // Slice 15 P2: with output.compact on, the empty fields are left out and counted.
         const compact = compactOutputEnabled() ? compactShow(transformed) : null;
         printResult(json, compact ? compact.item : transformed, res.status);
+        // Notices go to stderr, as transitions' does, so stdout stays one JSON document an agent can parse.
         if (!json && bodyTruncated) {
-          console.log(`… (bounded preview — complete body is ${bodyBytes} bytes; full record ${view.fullJsonBytes} JSON bytes: ${fullCommand})`);
+          console.error(`… (bounded preview — complete body is ${bodyBytes} bytes; full record ${view.fullJsonBytes} JSON bytes: ${fullCommand})`);
         }
-        if (compact && compact.emptyOmitted.length > 0) {
-          const notice = showEmptyNotice(compact.emptyOmitted, fullCommand);
-          if (json) console.error(notice); else console.log(notice);
-        }
+        if (compact && compact.emptyOmitted.length > 0) console.error(showEmptyNotice(compact.emptyOmitted, fullCommand));
       });
     });
 

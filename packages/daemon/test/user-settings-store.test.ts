@@ -25,7 +25,7 @@ const DEFAULT_EXTRA_INSTRUCTION_FILE_SUFFIX = "compaction/post-compact-extra.md"
 
 function clearEnv(): () => void {
   const keys = [
-    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB",
+    "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB", "OPENRIG_DAEMON_DB_CONFLICT",
     "OPENRIG_TRANSCRIPTS_ENABLED", "OPENRIG_TRANSCRIPTS_PATH",
     "OPENRIG_TRANSCRIPTS_LINES", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
     "OPENRIG_WORKSPACE_ROOT", "OPENRIG_WORKSPACE_SLICES_ROOT",
@@ -48,6 +48,7 @@ function clearEnv(): () => void {
     "OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED",
     "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS",
     // Slice 27 — Claude auto-compaction policy env-map.
+    "OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT",
     "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION",
@@ -90,7 +91,7 @@ describe("SettingsStore (User Settings v0)", () => {
 
   it("SETTINGS_VALID_KEYS matches the documented settings key set", () => {
     expect([...SETTINGS_VALID_KEYS]).toEqual([
-      "daemon.port", "daemon.host",
+      "daemon.port", "daemon.host", "daemon.db_conflict",
       // OPR.0.4.6.MH1 FR-1/FR-4 — host-selection pointer + own-host name.
       "host.selected",
       "host.name",
@@ -136,6 +137,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "runtime.codex.hooks_enabled",
       "runtime.readiness_timeout_seconds",
       // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10.
+      "policies.claude_compaction.preparation_root",
       "policies.claude_compaction.enabled",
       "policies.claude_compaction.threshold_percent",
       "policies.claude_compaction.pre_compact_instruction",
@@ -162,17 +164,25 @@ describe("SettingsStore (User Settings v0)", () => {
       "output.whoami_peers",
       // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
       "provider.usage_windows",
+      // The providers chosen at rig setup --providers, which kernel boot honours.
+      "provider.selected",
       "bundle.services_enabled",
       "usage.pi_cost_facts",
       "usage.pi_openrouter_charge",
       "transport.verify_input_box",
       "transport.local_user_guard",
+      // Slice 22 (OPR.0.7.2.22) — typed decisions, off by default.
+      "decisions.enabled",
+      "decisions.consumers",
+      "decisions.template_dir",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
       "retention.watchdog_days",
       "retention.usage_samples_days", // 51-08 A2 (plan-lock rev-1): the PM-ruled 14d telemetry window
       "retention.watchdog_keep_per_job",
+      "retention.stream_days", // slice 22 outcome 9: stream retention
+      "retention.stream_max_items",
       "retention.batch_size",
       "queue.pickup_stall_threshold_minutes",
       // S02 — standing-stuck-sweep cadence + unclaimed-obligation age.
@@ -206,6 +216,14 @@ describe("SettingsStore (User Settings v0)", () => {
     expect(() => store.resolveOne("context.root")).toThrow(/OPENRIG_CONTEXT_PACKS_ROOT.*OPENRIG_CONTEXT_ROOT/i);
   });
 
+  it("defaults database conflict handling to warn and persists the optional stop", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("daemon.db_conflict").value).toBe("warn");
+    store.set("daemon.db_conflict", "stop");
+    expect(store.resolveOne("daemon.db_conflict").value).toBe("stop");
+    expect(() => store.set("daemon.db_conflict", "always")).toThrow(/warn or stop/);
+  });
+
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new SettingsStore(configPath);
     expect(store.resolveOne("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
@@ -218,6 +236,18 @@ describe("SettingsStore (User Settings v0)", () => {
     expect(store.resolveOne("terminal.history_limit")).toMatchObject({ value: 50000, source: "file" });
     for (const raw of ["0", "-5000", "1999", "1000001", "2.5", "10000rows", "many"]) {
       expect(() => store.set("terminal.history_limit", raw)).toThrow(/terminal\.history_limit/);
+    }
+  });
+
+  it("defaults provider.selected to empty and accepts only claude, codex or both", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("provider.selected")).toMatchObject({ value: "", source: "default" });
+    store.set("provider.selected", "codex");
+    expect(store.resolveOne("provider.selected")).toMatchObject({ value: "codex", source: "file" });
+    store.set("provider.selected", "claude,codex");
+    expect(store.resolveOne("provider.selected")).toMatchObject({ value: "claude,codex", source: "file" });
+    for (const raw of ["gemini", "both", "claude,", "Claude", "claude codex"]) {
+      expect(() => store.set("provider.selected", raw)).toThrow(/provider\.selected/);
     }
   });
 
@@ -885,5 +915,41 @@ describe("parseNamedPairs (daemon copy)", () => {
   it("returns empty for empty/whitespace", () => {
     expect(parseNamedPairs("")).toEqual([]);
     expect(parseNamedPairs("  ")).toEqual([]);
+  });
+});
+
+
+describe("compaction preparation root", () => {
+  let tmpDir: string, configPath: string;
+  let restoreEnv: () => void;
+  beforeEach(() => {
+    restoreEnv = clearEnv();
+    tmpDir = mkdtempSync(join(tmpdir(), "preparation-root-settings-"));
+    configPath = join(tmpDir, "config.json");
+  });
+  afterEach(() => { restoreEnv(); rmSync(tmpDir, { recursive: true, force: true }); });
+  const key = "policies.claude_compaction.preparation_root";
+  it("resolves file/env overrides consistently and resets to workspace-first preparation", () => {
+    const store = new SettingsStore(configPath);
+    const root = join(tmpDir, "maps with spaces");
+    expect(store.resolveClaudeCompactionPolicy().preparationRoot).toBe("");
+    store.set(key, root);
+    expect(store.resolveOne(key)).toMatchObject({ value: root, source: "file" });
+    expect(new SettingsStore(configPath).resolveClaudeCompactionPolicy().preparationRoot).toBe(root);
+    process.env.OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT = join(root, "override");
+    try {
+      expect(store.resolveOne(key)).toMatchObject({ value: join(root, "override"), source: "env" });
+    } finally { delete process.env.OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT; }
+    store.reset(key);
+    expect(store.resolveClaudeCompactionPolicy().preparationRoot).toBe("");
+    store.set(key, "");
+    expect(store.resolveClaudeCompactionPolicy().preparationRoot).toBe("");
+  });
+  it.each(["relative/maps", "~/maps", " /maps", "/maps\0invalid"])("rejects invalid root %j without replacing valid settings", (value) => {
+    const store = new SettingsStore(configPath);
+    const root = join(tmpDir, "maps");
+    store.set(key, root);
+    expect(() => store.set(key, value)).toThrow(/absolute path/);
+    expect(store.resolveClaudeCompactionPolicy().preparationRoot).toBe(root);
   });
 });

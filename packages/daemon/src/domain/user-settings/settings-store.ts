@@ -66,6 +66,7 @@ export function resolveLegacyTopologyRigsRoot(): string {
 export const SETTINGS_VALID_KEYS = [
   "daemon.port",
   "daemon.host",
+  "daemon.db_conflict",
   // OPR.0.4.6.MH1 FR-1 — the persisted host-selection pointer, ONE
   // static key, lockstep with cli/src/config-store.ts VALID_KEYS (the
   // twins parity test pins both). Default "local" (unset ≡ local host).
@@ -151,7 +152,7 @@ export const SETTINGS_VALID_KEYS = [
   "runtime.codex.hooks_enabled",
   "runtime.readiness_timeout_seconds",
   // Slice 27 — Claude auto-compaction policy. SC-29 EXCEPTION #10:
-  // 7 keys (lockstep with cli/src/config-store.ts VALID_KEYS).
+  // 8 keys (lockstep with cli/src/config-store.ts VALID_KEYS).
   // Opt-in default-off; daemon ContextMonitor reads `enabled` +
   // `threshold_percent` to decide when to send pre-compact prep +
   // /compact. The daemon wraps `pre_compact_instruction` with usage
@@ -159,6 +160,7 @@ export const SETTINGS_VALID_KEYS = [
   // the actual compaction phase, uses `message_inline` +
   // `message_file_path` for post-compaction restore guidance, then
   // wraps `post_restore_audit_instruction` as the read-depth nudge.
+  "policies.claude_compaction.preparation_root",
   "policies.claude_compaction.enabled",
   "policies.claude_compaction.threshold_percent",
   "policies.claude_compaction.pre_compact_instruction",
@@ -192,6 +194,8 @@ export const SETTINGS_VALID_KEYS = [
   "output.whoami_peers",
   // Slice 01 (OPR.0.7.0.1) — Codex and Claude usage windows in the provider view; daemon-read, twin of the CLI key.
   "provider.usage_windows",
+  // The providers chosen at rig setup --providers; kernel boot counts only these. Twin of the CLI key.
+  "provider.selected",
   // Service-backed archives, including packing, preview and durable-target admission; default off.
   "bundle.services_enabled",
   "usage.pi_cost_facts",
@@ -199,6 +203,11 @@ export const SETTINGS_VALID_KEYS = [
   // A verified Claude Code or Codex send reports on input-box evidence; daemon-read, twin of the CLI key.
   "transport.verify_input_box",
   "transport.local_user_guard",
+  // Slice 22 (OPR.0.7.2.22) — typed decisions (OpenRouter + Jev), off by default; read by the invoking
+  // rig process, never by the daemon. Twin of the CLI keys.
+  "decisions.enabled",
+  "decisions.consumers",
+  "decisions.template_dir",
   // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs (arch D3; closed-set,
   // arch-safe defaults BAKED in getDefaultValue, bounded validation in
   // KEY_CONSTRAINTS). CLI-settable twin: lockstep with cli/src/config-store.ts
@@ -210,6 +219,9 @@ export const SETTINGS_VALID_KEYS = [
   "retention.watchdog_days",
   "retention.usage_samples_days",
   "retention.watchdog_keep_per_job",
+  // Slice 22 outcome 9 — stream retention: unreferenced items older than N days or beyond the newest N.
+  "retention.stream_days",
+  "retention.stream_max_items",
   "retention.batch_size",
   // S04 (OPR.0.5.5.4) — pickup-receipt stall threshold; net-new key, OPENRIG_* only,
   // CLI-settable twin lockstep with cli/src/config-store.ts VALID_KEYS. Fresh-read per
@@ -238,6 +250,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   // compatibility. New typed keys use OPENRIG_* only.
   "daemon.port": { primary: "OPENRIG_PORT", legacy: "RIGGED_PORT" },
   "daemon.host": { primary: "OPENRIG_HOST", legacy: "RIGGED_HOST" },
+  "daemon.db_conflict": { primary: "OPENRIG_DAEMON_DB_CONFLICT" },
   "db.path": { primary: "OPENRIG_DB", legacy: "RIGGED_DB" },
   "transcripts.enabled": { primary: "OPENRIG_TRANSCRIPTS_ENABLED", legacy: "RIGGED_TRANSCRIPTS_ENABLED" },
   "transcripts.path": { primary: "OPENRIG_TRANSCRIPTS_PATH", legacy: "RIGGED_TRANSCRIPTS_PATH" },
@@ -287,6 +300,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "runtime.readiness_timeout_seconds": { primary: "OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS" },
   // Slice 27 — Claude auto-compaction policy. Net-new keys; OPENRIG_X
   // primary only.
+  "policies.claude_compaction.preparation_root": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT" },
   "policies.claude_compaction.enabled": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_ENABLED" },
   "policies.claude_compaction.threshold_percent": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_THRESHOLD_PERCENT" },
   "policies.claude_compaction.pre_compact_instruction": { primary: "OPENRIG_POLICIES_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION" },
@@ -308,17 +322,23 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
   "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
   "provider.usage_windows": { primary: "OPENRIG_PROVIDER_USAGE_WINDOWS" },
+  "provider.selected": { primary: "OPENRIG_PROVIDER_SELECTED" },
   "bundle.services_enabled": { primary: "OPENRIG_BUNDLE_SERVICES_ENABLED" },
   "usage.pi_cost_facts": { primary: "OPENRIG_USAGE_PI_COST_FACTS" },
   "usage.pi_openrouter_charge": { primary: "OPENRIG_USAGE_PI_OPENROUTER_CHARGE" },
   "transport.local_user_guard": { primary: "OPENRIG_TRANSPORT_LOCAL_USER_GUARD" },
   "transport.verify_input_box": { primary: "OPENRIG_TRANSPORT_VERIFY_INPUT_BOX" },
+  "decisions.enabled": { primary: "OPENRIG_DECISIONS_ENABLED" },
+  "decisions.consumers": { primary: "OPENRIG_DECISIONS_CONSUMERS" },
+  "decisions.template_dir": { primary: "OPENRIG_DECISIONS_TEMPLATE_DIR" },
   // OPR.0.4.6.FS-1 W2 — retention knobs; net-new keys, OPENRIG_* primary only.
   "retention.enabled": { primary: "OPENRIG_RETENTION_ENABLED" },
   "retention.transitions_days": { primary: "OPENRIG_RETENTION_TRANSITIONS_DAYS" },
   "retention.watchdog_days": { primary: "OPENRIG_RETENTION_WATCHDOG_DAYS" },
   "retention.usage_samples_days": { primary: "OPENRIG_RETENTION_USAGE_SAMPLES_DAYS" },
   "retention.watchdog_keep_per_job": { primary: "OPENRIG_RETENTION_WATCHDOG_KEEP_PER_JOB" },
+  "retention.stream_days": { primary: "OPENRIG_RETENTION_STREAM_DAYS" },
+  "retention.stream_max_items": { primary: "OPENRIG_RETENTION_STREAM_MAX_ITEMS" },
   "retention.batch_size": { primary: "OPENRIG_RETENTION_BATCH_SIZE" },
   // S04 — net-new key; OPENRIG_* primary only.
   "queue.pickup_stall_threshold_minutes": { primary: "OPENRIG_QUEUE_PICKUP_STALL_THRESHOLD_MINUTES" },
@@ -334,6 +354,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
 const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "daemon.port": ["daemon", "port"],
   "daemon.host": ["daemon", "host"],
+  "daemon.db_conflict": ["daemon", "dbConflict"],
   "db.path": ["db", "path"],
   "transcripts.enabled": ["transcripts", "enabled"],
   "transcripts.path": ["transcripts", "path"],
@@ -377,6 +398,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "feed.subscriptions.audit_log": ["feed", "subscriptions", "auditLog"],
   "runtime.codex.hooks_enabled": ["runtime", "codex", "hooksEnabled"],
   "runtime.readiness_timeout_seconds": ["runtime", "readinessTimeoutSeconds"],
+  "policies.claude_compaction.preparation_root": ["policies", "claudeCompaction", "preparationRoot"],
   "policies.claude_compaction.enabled": ["policies", "claudeCompaction", "enabled"],
   "policies.claude_compaction.threshold_percent": ["policies", "claudeCompaction", "thresholdPercent"],
   "policies.claude_compaction.pre_compact_instruction": ["policies", "claudeCompaction", "preCompactInstruction"],
@@ -397,16 +419,22 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "output.compact": ["output", "compact"],
   "output.whoami_peers": ["output", "whoamiPeers"],
   "provider.usage_windows": ["provider", "usageWindows"],
+  "provider.selected": ["provider", "selected"],
   "bundle.services_enabled": ["bundle", "servicesEnabled"],
   "usage.pi_cost_facts": ["usage", "piCostFacts"],
   "usage.pi_openrouter_charge": ["usage", "piOpenRouterCharge"],
   "transport.local_user_guard": ["transport", "localUserGuard"],
   "transport.verify_input_box": ["transport", "verifyInputBox"],
+  "decisions.enabled": ["decisions", "enabled"],
+  "decisions.consumers": ["decisions", "consumers"],
+  "decisions.template_dir": ["decisions", "templateDir"],
   "retention.enabled": ["retention", "enabled"],
   "retention.transitions_days": ["retention", "transitionsDays"],
   "retention.watchdog_days": ["retention", "watchdogDays"],
   "retention.usage_samples_days": ["retention", "usageSamplesDays"],
   "retention.watchdog_keep_per_job": ["retention", "watchdogKeepPerJob"],
+  "retention.stream_days": ["retention", "streamDays"],
+  "retention.stream_max_items": ["retention", "streamMaxItems"],
   "retention.batch_size": ["retention", "batchSize"],
   "queue.pickup_stall_threshold_minutes": ["queue", "pickupStallThresholdMinutes"],
   "queue.stuck_sweep_interval_seconds": ["queue", "stuckSweepIntervalSeconds"],
@@ -618,6 +646,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
   switch (key) {
     case "daemon.port": return 7433;
     case "daemon.host": return "127.0.0.1";
+    case "daemon.db_conflict": return "warn";
     case "db.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "openrig.sqlite");
     case "transcripts.enabled": return true;
     case "transcripts.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "transcripts");
@@ -673,6 +702,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // the canonical restore skill; compact_instruction is intentionally
     // blank because Claude's native compact summary is less reliable
     // than the explicit pre-compact and post-compact user-channel flow.
+    case "policies.claude_compaction.preparation_root": return "";
     case "policies.claude_compaction.enabled": return false;
     case "policies.claude_compaction.threshold_percent": return 80;
     case "policies.claude_compaction.pre_compact_instruction": return DEFAULT_CLAUDE_COMPACTION_PRE_COMPACT_INSTRUCTION;
@@ -697,6 +727,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "output.compact": return false;
     case "output.whoami_peers": return 8;
     case "provider.usage_windows": return false;
+    case "provider.selected": return "";
     case "bundle.services_enabled": return false;
     // Slice 02 — Pi cost facts from persisted entries; off until the switch is on.
     case "usage.pi_cost_facts": return false;
@@ -704,6 +735,10 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // Input-box evidence for verified Claude Code and Codex sends; off until the switch is on.
     case "transport.local_user_guard": return false;
     case "transport.verify_input_box": return false;
+    // Slice 22 — typed decisions off, no consumers, shipped templates only.
+    case "decisions.enabled": return false;
+    case "decisions.consumers": return "";
+    case "decisions.template_dir": return "";
     // OPR.0.4.6.FS-1 W2 — retention defaults (arch D3 safe values: archive
     // terminal+aged transitions >30d; prune watchdog_history >14d keep-50/job;
     // 500 rows/qitems per bounded batch; enabled by default).
@@ -712,6 +747,8 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "retention.watchdog_days": return 14;
     case "retention.usage_samples_days": return 14;
     case "retention.watchdog_keep_per_job": return 50;
+    case "retention.stream_days": return 30;
+    case "retention.stream_max_items": return 20000;
     case "retention.batch_size": return 500;
     case "queue.pickup_stall_threshold_minutes": return 3;
     case "queue.stuck_sweep_interval_seconds": return 300;
@@ -771,6 +808,9 @@ function percentageConstraint(key: string) {
 }
 
 const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: string | number | boolean) => void>> = {
+  "daemon.db_conflict": (raw) => {
+    if (raw !== "warn" && raw !== "stop") throw new Error("daemon.db_conflict must be warn or stop");
+  },
   "transcripts.lines": (raw, value) => {
     if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
       throw new Error("Invalid transcripts.lines: must be an integer in [1, 1000000]");
@@ -833,6 +873,16 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   // "80.5" → 80) is not safe for a key the daemon's compaction trigger
   // reads at every poll tick; runtime validator rejects what the
   // contract forbids per banked feedback_static_gates_mirror_runtime_validators.
+  "provider.selected": (_raw, value) => {
+    if (typeof value !== "string" || !/^(|claude|codex|claude,codex|codex,claude)$/.test(value)) {
+      throw new Error("Invalid provider.selected: use claude, codex, claude,codex, or an empty string for no recorded choice");
+    }
+  },
+  "policies.claude_compaction.preparation_root": (_raw, value) => {
+    if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
+      throw new Error("Invalid policies.claude_compaction.preparation_root: use an absolute path or an empty string for the default");
+    }
+  },
   "policies.claude_compaction.threshold_percent": (raw, coerced) => {
     const trimmed = (raw ?? "").trim();
     if (!/^-?\d+$/.test(trimmed)) {
@@ -905,6 +955,16 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for retention.watchdog_keep_per_job: must be an integer >= 0, got "${raw}"`);
     }
   },
+  "retention.stream_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.stream_days: must be an integer >= 1, got "${raw}"`);
+    }
+  },
+  "retention.stream_max_items": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
+      throw new Error(`Invalid value for retention.stream_max_items: must be an integer >= 1, got "${raw}"`);
+    }
+  },
   "retention.batch_size": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
       throw new Error(`Invalid value for retention.batch_size: must be an integer >= 1, got "${raw}"`);
@@ -919,6 +979,11 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   "queue.wake_unconfirmed_window_minutes": positiveIntegerConstraint("queue.wake_unconfirmed_window_minutes"),
   "queue.wake_swap_grace_seconds": positiveIntegerConstraint("queue.wake_swap_grace_seconds"),
   "queue.wake_human_rung": wakeHumanRungConstraint,
+  "decisions.template_dir": (_raw, value) => {
+    if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
+      throw new Error("Invalid decisions.template_dir: use an absolute path, or an empty string for the shipped templates only");
+    }
+  },
 };
 
 function validateKeyConstraints(key: SettingsValidKey, raw: string, coerced: string | number | boolean): void {
@@ -950,6 +1015,8 @@ function validateTypedFileValue(key: SettingsValidKey, value: string | number | 
  * shape via direct config.json read (without depending on the daemon).
  */
 export interface ClaudeCompactionPolicy {
+  /** Empty or absent keeps workspace-first preparation; read for each new attempt. */
+  preparationRoot?: string;
   enabled: boolean;
   thresholdPercent: number;
   preCompactInstruction: string;
@@ -1108,6 +1175,7 @@ export class SettingsStore {
     const fc = this.readConfigFile();
     const wr = this.resolveWorkspaceRootRaw(fc);
     return {
+      preparationRoot: this.resolveOne("policies.claude_compaction.preparation_root", fc, wr).value as string,
       enabled: this.resolveOne("policies.claude_compaction.enabled", fc, wr).value as boolean,
       thresholdPercent: this.resolveOne("policies.claude_compaction.threshold_percent", fc, wr).value as number,
       preCompactInstruction: this.resolveOne("policies.claude_compaction.pre_compact_instruction", fc, wr).value as string,

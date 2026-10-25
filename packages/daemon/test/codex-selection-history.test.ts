@@ -138,7 +138,10 @@ describe("Codex adjacent normal-frame selection history through rig-send HTTP", 
       const classifier = classifyPaneActivity(frame.pane ?? "", { runtime: frame.runtime ?? "codex" });
       observations.push({ id: frame.id, hook, corrected: frame.corrected ?? false, classifier,
         status: result.response.status, body: result.body, effects: result.effects });
-      const refuse = hook === "permission" || (hook === "none" && frame.needsInput);
+      const currentClaudePrompt = frame.runtime === "claude-code" &&
+        (frame.id === "tall Claude picker" || frame.id === "clipped Claude permission");
+      const refuse = hook === "permission" || (hook === "none" && frame.needsInput) ||
+        (hook === "running" && currentClaudePrompt);
       expect(result.response.status).toBe(refuse ? 409 : 200);
       expect(result.body).toMatchObject(refuse ? { ok: false, reason: "target_needs_input" } : { ok: true });
       if (refuse) expect(result.effects).toEqual([]);

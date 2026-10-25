@@ -125,7 +125,8 @@ describe("current Claude MCP menus through assessment, readiness and HTTP send",
       inventory: inventory.map(x => x.agentActivity), sends });
     const currentMcp = frame.id === "old-current-MCP" || frame.id === "2.1.303-current-MCP";
     for (const { hook, status, body, effects } of sends) {
-      const blocked = hook === "permission" || (hook === "none" && (currentMcp || frame.id === "ordinary-current-permission"));
+      const currentSelection = currentMcp || frame.id === "ordinary-current-permission";
+      const blocked = hook === "permission" || ((hook === "none" || hook === "running") && currentSelection);
       expect(body.ok).toBe(!blocked);
       expect(status).toBe(blocked ? 409 : 200);
       expect(effects.map(x => x.kind)).toEqual(blocked ? [] : ["paste", "keys"]);

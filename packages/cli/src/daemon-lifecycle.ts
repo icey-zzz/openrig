@@ -187,6 +187,7 @@ export interface StartOptions {
   // Exposed at the CLI as `rig daemon start --no-kernel`; projected
   // into the daemon process env as OPENRIG_NO_KERNEL.
   skipKernelBoot?: boolean;
+  allowDbConflict?: boolean;
 }
 
 export interface LifecycleDeps {
@@ -244,7 +245,18 @@ const DEFAULT_DB = "openrig.sqlite";
 // Fresh Linux hosts can take longer than a warmed dev machine to load native
 // modules, run startup reconciliation, and bind healthz. Keep the retry loop
 // bounded, but do not kill a healthy daemon during first-boot slack.
-const HEALTHZ_RETRIES = 80;
+// #1786: one elapsed deadline, started when the readiness loop begins (after the
+// child is spawned and its handlers are attached), covers every primary probe,
+// listener check and backoff (the 20s the old 80 x 250ms delays gave). Each probe
+// may take up to STARTUP_PROBE_TIMEOUT_MS, so a busy child that answers correctly
+// in a second is accepted, but no probe timer outlives the deadline (a 2s startup
+// ceiling, not a universal header wait). The deadline only stops new probes and
+// backoff: timers cannot preempt synchronous work in this process, so a verified
+// answer already in hand when the clock passes it is still used, with the usual
+// liveness and publication rechecks. A failed start may add up to
+// DAEMON_STOP_WAIT_MS of owned-child cleanup.
+const STARTUP_READINESS_DEADLINE_MS = 20_000;
+const STARTUP_PROBE_TIMEOUT_MS = 2_000;
 const HEALTHZ_DELAY_MS = 250;
 // OPR.0.4.7 slice-05 item-4: the WHOLE status health probe stays within ONE normal
 // CLI request window (~5s, matching DaemonClient's timeoutMs) — immediate connection
@@ -261,7 +273,7 @@ const STATUS_PROBE_MAX_ATTEMPTS = 5;
 const STATUS_PROBE_RETRY_DELAY_MS = 200;
 // Per-probe /healthz timeout for the SINGLE-SHOT callers that are NOT the status
 // settle path — checkPid classification and the start/stop recovery guards, plus
-// each iteration of startDaemon's own HEALTHZ_RETRIES poll loop. These keep their
+// startDaemon's pre-spawn checks (its readiness probes use STARTUP_PROBE_TIMEOUT_MS). These keep their
 // prior fixed-bound timing (the settle deadline above is status-probe-LOCAL); this
 // restores the timeout the removed HEALTHZ_PROBE_TIMEOUT_MS supplied to them.
 const HEALTHZ_PROBE_TIMEOUT_MS = 250;
@@ -480,6 +492,7 @@ export function buildDaemonEnv(
     // V0.3.1 slice 05 — projected via OPENRIG_NO_KERNEL env var so
     // the daemon's startup.ts kernel-boot path honors the flag.
     skipKernelBoot?: boolean;
+    allowDbConflict?: boolean;
   },
 ): Record<string, string> {
   const env: Record<string, string> = {};
@@ -502,6 +515,7 @@ export function buildDaemonEnv(
     env["OPENRIG_HOST"] = opts.host;
   }
   env["OPENRIG_DB"] = opts.db;
+  if (opts.allowDbConflict) env["OPENRIG_ALLOW_DB_CONFLICT"] = "1";
   if (opts.transcriptsEnabled !== undefined) {
     env["OPENRIG_TRANSCRIPTS_ENABLED"] = String(opts.transcriptsEnabled);
   }
@@ -694,6 +708,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
       transcriptsLines: opts.transcriptsLines,
       transcriptsPollIntervalSeconds: opts.transcriptsPollIntervalSeconds,
       skipKernelBoot: opts.skipKernelBoot,
+      allowDbConflict: opts.allowDbConflict,
     }),
     stdio: ["ignore", logFd, logFd],
     detached: true,
@@ -715,7 +730,8 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     const startupLog = deps.readFileFrom
       ? deps.readFileFrom(LOG_FILE, logOffset) ?? ""
       : Buffer.from(deps.readFile(LOG_FILE) ?? "").subarray(logOffset).toString();
-    const guidance = /\bEADDRINUSE\b/.test(startupLog)
+    const dbConflict = startupLog.match(/^(?:Error: )?(OPENRIG_DB_CONFLICT:[^\r\n]*)/m)?.[1];
+    const guidance = dbConflict ? ` ${dbConflict}` : /\bEADDRINUSE\b/.test(startupLog)
       ? ` ${occupiedPortGuidance(port)}`
       : ` See ${LOG_FILE} for details.`;
     childFailure = new Error(`Daemon child ${child.pid ?? "unknown"} exited before startup completed (code ${code}, signal ${signal ?? "none"}).${guidance}`);
@@ -734,14 +750,18 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
   };
   const healthzUrl = `http://${formatDaemonHostForUrl(probeHost)}:${port}/healthz`;
   type StartHealth = { databaseWarnings?: unknown; pid?: unknown; bind?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean } };
+  let deadline = Number.POSITIVE_INFINITY;
+  const remaining = (): number => Math.max(0, deadline - Date.now());
   const readOwnedHealth = async (url: string): Promise<StartHealth | null> => {
     assertChild();
+    // No new primary or listener fetch once the deadline has passed: a 0ms timer would still start one.
+    if (remaining() <= 0) throw new HealthProbeTimeoutError(url);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
         failed,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new HealthProbeTimeoutError(url)), HEALTHZ_PROBE_TIMEOUT_MS);
+          timer = setTimeout(() => reject(new HealthProbeTimeoutError(url)), Math.min(STARTUP_PROBE_TIMEOUT_MS, remaining()));
         }),
         (async () => {
           const res = await deps.fetch(url);
@@ -768,7 +788,8 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     let databaseWarnings: string[] = [];
     let lastProbe = "health endpoint not responding";
     let unverified: string[] | null = null;
-    for (let i = 0; i < HEALTHZ_RETRIES; i++) {
+    deadline = Date.now() + STARTUP_READINESS_DEADLINE_MS;
+    while (remaining() > 0) {
       unverified = null;
       try {
         const body = await readOwnedHealth(healthzUrl);
@@ -799,7 +820,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
         if (error instanceof StartupIdentityError) throw error;
         lastProbe = error instanceof Error ? error.message : String(error);
       }
-      await Promise.race([new Promise((resolve) => setTimeout(resolve, HEALTHZ_DELAY_MS)), failed]);
+      await Promise.race([new Promise((resolve) => setTimeout(resolve, Math.min(HEALTHZ_DELAY_MS, remaining()))), failed]);
     }
     // In the last round the child's own endpoint named its PID, and only another listener's check stayed
     // uncertain: start, and say which listener is unverified.
@@ -925,8 +946,11 @@ export async function stopDaemon(deps: LifecycleDeps): Promise<"stopped" | "no-t
   }
 
   let notBefore = Date.parse(state.startedAt);
+  // Only a signalling stop names a request time: this process's clock just before kill, not delivery.
+  let requested = "";
   if (pidState !== "dead") {
     notBefore = Date.now();
+    requested = `; SIGTERM requested at ${new Date(notBefore).toISOString()}`;
     deps.kill(state.pid, "SIGTERM");
     // One signal. An already-exited target goes straight to the same judgment.
     const deadline = Date.now() + DAEMON_STOP_WAIT_MS;
@@ -936,7 +960,7 @@ export async function stopDaemon(deps: LifecycleDeps): Promise<"stopped" | "no-t
   }
   const present = deps.isProcessAlive(state.pid);
   const effect = await listener();
-  const observation = `targeted ${target}; checked ${check}; PID ${state.pid} ${present ? "present" : "absent"}; listener ${effect}`;
+  const observation = `targeted ${target}; checked ${check}; PID ${state.pid} ${present ? "present" : "absent"}; listener ${effect}${requested}`;
   if (present) {
     throw new Error(`Daemon did not exit after SIGTERM within ${DAEMON_STOP_WAIT_MS}ms; ${observation}` +
       (effect === "responding" ? " (still listening)" : "") + "; state file preserved.");

@@ -38,7 +38,7 @@ import { getSelfHostId } from "../../hosts/fanout-contract.js";
 import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
 import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./socket-inbound.js";
-import { loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
+import { HUMAN_ALERT_TAG, loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
 import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../queue-repository.js";
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
@@ -97,6 +97,9 @@ export function makeHumanReplyResolver(
     const source = queueRepo.getById(input.qitemId);
     if (source?.humanIntent === "update") return "not-applicable";
     if (!contract) return "not-applicable";
+    // A different person's reply to a question parked on someone else already reached the agent as their own message
+    // (the inbound row, linked to the question). It doesn't resume the question, which stays parked on its person.
+    if (source?.state === "blocked" && queueRepo.askedSomeoneElse(input.actorSession, source.blockedOn)) return "not-applicable";
     const uncertainDecision = `${input.decision}\n\n---\nOpenRig timing context (Slack reply ${JSON.stringify([input.actorSession, input.messageTs ?? null])}): This reply resumed the question, but its ordering against the posted question could not be confirmed. Resuming is not approval; read the person's words in context.`;
     // An acknowledgement retry must not resolve again. Match this reply's durable
     // context, not an older episode's generic resolved marker.
@@ -306,6 +309,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     return decideDelivery({
       level: p.ownerNotificationLevel ?? null,
       escalation: p.humanIntent !== "update" && isEscalationClass(p.tags),
+      alerted: p.humanIntent !== "update" && (p.tags ?? []).includes(HUMAN_ALERT_TAG),
       human: {
         entityId: human.entityId,
         deliveryClass: human.prefs.deliveryClass,

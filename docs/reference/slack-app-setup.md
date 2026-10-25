@@ -137,7 +137,9 @@ part of OpenRig.
 
 ## One channel per rig or seat (optional)
 
-By default every human-bound item posts to the one channel from `rig slack setup --channel`.
+Every ask to a person posts to Slack by default: that's their Slack subscription's `every-ask` preset. A person who wants
+Slack for urgent asks only sets `rig gateway human set <id> slack-subscription urgent-only`: then only an ask marked
+`--alert` posts, and the rest wait on Steering and the TUI. An ask marked `--alert` stands out either way (an interrupt with a mention). By default every post goes to the one channel from `rig slack setup --channel`.
 To follow each rig separately, post a rig's items, or a single seat's, to its own channel:
 
 ```bash
@@ -303,7 +305,7 @@ decisions, and posts its own replies.
   removed. An enabled connector retries them; disabling it pauses retry without deleting them.
   Let relays finish before removing a forward entry. A zero dead-letter backlog alone does not
   prove they have drained: it does not count relay HTTP requests still in flight.
-- **Who answered:** every post ends `from <seat> on <machine>`, using the machine's host id (set
+- **Who answered:** every post starts `From <seat> on <machine>`, using the machine's host id (set
   it with `host.name`).
 - **The hub's own channels** are handled on the hub, as before. A channel can be relayed to one
   machine only, and never the hub's own default channel.

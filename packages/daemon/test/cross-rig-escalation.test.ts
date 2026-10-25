@@ -242,6 +242,56 @@ describe("same-daemon escalation routes (#605)", () => {
     expect(forwarded).toHaveLength(1);
     expect(forwarded[0]!.tags).toContain(`recovery-for:${ordinary.qitemId}`);
     expect(forwarded[0]!.tags).not.toContain(`recovery-for:${consumed.qitemId}`);
+    expect(queue.getById(ordinary.qitemId)!.tags ?? []).not.toContain(ESCALATION_HOP_TAG);
+  });
+
+  it.each([
+    { path: "ladder", withEngine: true },
+    { path: "ladder", withEngine: false },
+    { path: "prompt", withEngine: false },
+    { path: "choice", withEngine: true },
+  ])("keeps a consumed handoff visible on the $path floor with engine=$withEngine", async ({ path, withEngine }) => {
+    const b = seat("b", "top.lead", "lead@b");
+    const c = seat("c", "top.lead", "lead@c");
+    const d = seat("d", "top.lead", "lead@d");
+    rigs.addEdge(c.rig.id, c.node.id, d.session, "escalates_to");
+    const recovery = await queue.create({ sourceSession: "watchdog@system", destinationSession: b.session,
+      body: "Cross-rig recovery", tags: [ESCALATION_HOP_TAG], nudge: false });
+    const { created } = await queue.handoff({ qitemId: recovery.qitemId, fromSession: b.session,
+      toSession: c.session, tags: [], nudge: false });
+    db.prepare("UPDATE queue_items SET ts_created=?, last_nudge_result=? WHERE qitem_id=?")
+      .run(new Date(Date.now() - 3_600_000).toISOString(), path === "ladder" ? "failed:fixture transport" : null, created.qitemId);
+    if (path !== "ladder") {
+      const key = `${c.session}|consumed#1`;
+      queue.update({ qitemId: created.qitemId, actorSession: "watchdog@system", transitionNote:
+        `parked-owner wake reserved: ${key}; obligations ${created.qitemId}` });
+      queue.update({ qitemId: created.qitemId, actorSession: "watchdog@system", transitionNote:
+        `parked-owner wake delivery refused: ${key}; Refused: interactive prompt${path === "choice" ? " (selection_prompt)" : ""}` });
+    }
+    const posted: string[] = [];
+    const woken: string[] = [];
+    const status = createWakeLadderStatus();
+    const deps = { db, queueRepo: queue, status, retryCap: 0, humanRung: "explicit-only" as const,
+      loadHumanRegistry: () => ({ ok: true as const, entities: [] }), log: () => {},
+      readPromptState: () => "blocked" as const,
+      attemptWake: async (_id: string, target: string) => { woken.push(target); return "verified"; },
+      deliveryEngine: withEngine ? { dispatchEscalation: async (row: { qitemId: string }) => {
+        posted.push(row.qitemId); return { decision: "post", resolved: true, dispatched: true };
+      } } : undefined };
+    const result = await runWakeLadderTick(deps);
+    expect(result.outcome, result.error).not.toBe("failed");
+    expect(result.actions).toContainEqual({ qitemId: created.qitemId, action: "escalate-operator" });
+    const floors = () => queue.list({ limit: 100 }).filter(row =>
+      row.tags?.includes("wake-escalation") && row.tags.includes(`recovery-for:${created.qitemId}`));
+    expect(floors()).toHaveLength(1);
+    expect(status.snapshot().escalationsOpen).toBeGreaterThanOrEqual(1);
+    expect(posted).toEqual([]);
+    expect(woken).toEqual([]);
+    expect(floors()[0]!.destinationSession).not.toBe(d.session);
+    await runWakeLadderTick(deps);
+    expect(floors()).toHaveLength(1);
+    expect(posted).toEqual([]);
+    expect(woken).toEqual([]);
   });
 
   it.each([false, true])("a mixed prompt refusal preserves ordinary routing with existing consumed recovery=%s", async ownedElsewhere => {

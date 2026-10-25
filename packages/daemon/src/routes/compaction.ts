@@ -1,3 +1,4 @@
+import { transportSenderSession } from "./require-sender-identity.js";
 import { physicalSessionName } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import { shellQuote } from "../adapters/shell-quote.js";
@@ -52,14 +53,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     // Resolve the DB node id + runtime for the latest session row.
-    const row = db.prepare(`
-      SELECT n.id AS node_id, n.runtime AS runtime, n.cwd AS cwd
-      FROM sessions s
-      JOIN nodes n ON s.node_id = n.id
-      WHERE s.session_name = ?
-      ORDER BY s.id DESC
-      LIMIT 1
-    `).get(sessionName) as { node_id: string; runtime: string | null; cwd: string | null } | undefined;
+    const row = latestSeatNode(db, sessionName);
     if (!row) {
       return c.json({
         ok: false,
@@ -74,6 +68,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
     const usage = usageStore.getForNode(row.node_id, sessionName);
     const outcome = await enforcer.triggerManualCompact(
       {
+        nodeId: row.node_id,
         sessionName,
         runtime: row.runtime,
         cwd: row.cwd,
@@ -84,7 +79,7 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
       // This is the OPERATOR's manual-trigger verb (bearer-auth'd); the resulting sequence is
       // drain-exempt while auto-compaction is disabled. GHOST-STAGE fix (a) actor-gate: automation
       // paths that do NOT set this are NOT exempt, so they cannot launder a drain past the gate.
-      { operatorInitiated: true, skipMap: body.skipMap === true },
+      { operatorInitiated: true, skipMap: body.skipMap === true, actor: { source: "caller", session: transportSenderSession(c) ?? null } },
     );
 
     if (outcome.triggered) {
@@ -140,15 +135,35 @@ export function compactionRoutes(opts?: { bearerToken?: string | null }): Hono {
     if (!session) {
       return c.json({ ok: false, error: "Missing required query param: session" }, 400);
     }
+    // After a restart, the first look at a seat picks up its record, as the context monitor's first poll would.
+    const db = c.get("db" as never) as Database.Database | undefined;
+    const seat = db ? latestSeatNode(db, session) : undefined;
+    if (seat) enforcer.recoverSeat({ sessionName: session, cwd: seat.cwd, runtime: seat.runtime });
     const preparation = enforcer.getPreparationState(session);
+    const stranded = enforcer.getStrandedCompaction(session);
+    const owedRestore = enforcer.getOwedRestore(session);
     return c.json({ ok: true, session, state: enforcer.getManualCompactionState(session), preparation,
+      ...(owedRestore ? { owedRestore } : {}),
       ...(preparation ? { compact: compactResultText(preparation.compact) } : {}),
       ...(preparation?.reason === "occupant_generation_unavailable"
         ? { guidance: manualReasonMessage(session, preparation.reason) } : {}),
+      ...(stranded ? { stranded: { ...stranded, detail: "This seat's managed compaction is from before an OpenRig restart and too old for OpenRig to resume, so its restore steps may still be owed. If it compacted or you can't tell, send it a normal restore request naming mapPath, asking it to skip reading if it did not compact." } } : {}),
     });
   });
 
   return router;
+}
+
+/** The node behind a session's latest row: its id, runtime and launch workspace. */
+function latestSeatNode(db: Database.Database, sessionName: string): { node_id: string; runtime: string | null; cwd: string | null } | undefined {
+  return db.prepare(`
+    SELECT n.id AS node_id, n.runtime AS runtime, n.cwd AS cwd
+    FROM sessions s
+    JOIN nodes n ON s.node_id = n.id
+    WHERE s.session_name = ?
+    ORDER BY s.id DESC
+    LIMIT 1
+  `).get(sessionName) as { node_id: string; runtime: string | null; cwd: string | null } | undefined;
 }
 
 function manualOutcomeMessage(sessionName: string, outcome: Extract<ManualCompactionOutcome, { triggered: false }>): string {
@@ -157,7 +172,9 @@ function manualOutcomeMessage(sessionName: string, outcome: Extract<ManualCompac
   const effect = prep.delivery === "delivered" ? "Preparation was sent" : "Preparation may have reached the seat (delivery is unconfirmed)";
   const detail = outcome.reason === "preparation_incomplete"
     ? manualReasonMessage(sessionName, outcome.reason)
-    : `/compact was not confirmed (${outcome.reason}). This attempt is disarmed.`;
+    : outcome.restoreOwed
+      ? `/compact was not confirmed (${outcome.reason}) and is never sent again. Its restore steps follow in case it ran; the restore request tells the seat to say so and skip if it didn't compact.`
+      : `/compact was not confirmed (${outcome.reason}). This attempt is disarmed.`;
   return `${effect} for '${sessionName}' (attempt ${prep.attemptId}). ${detail} Its map remains at ${prep.mapPath} if written. Inspect rig compact ${shellQuote(sessionName)} --state before an explicit retry.`;
 }
 
@@ -173,6 +190,10 @@ export function compactResultText(compact: "not_sent" | "submitted_unconfirmed" 
 
 function manualReasonMessage(sessionName: string, reason: string): string {
   switch (reason) {
+    case "terminal_policy_refused":
+      return `Managed compaction for '${sessionName}' was refused by its terminal policy. Read rig seat status ${shellQuote(sessionName)}; an authorised policy change uses rig seat set-terminal-policy. The existing rig send --dangerously-interact --reason path is unchanged; prompt and interruption guards still apply.`;
+    case "terminal_policy_unavailable":
+      return `Could not read the selected terminal policy for '${sessionName}'; no new managed compaction is authorised. Inspect rig seat status ${shellQuote(sessionName)}.`;
     case "occupant_generation_unavailable":
       return `The occupant generation could not be resolved for '${sessionName}'; no preparation or compact was sent. For the confirmed live seat, run rig reconcile-session ${shellQuote(sessionName)} --no-launch, then explicitly retry rig compact ${shellQuote(sessionName)}. Reconciliation does not restart this attempt.`;
     case "preparation_incomplete":

@@ -1,10 +1,11 @@
+import { parseTerminalPolicy, TerminalPolicyRefusal, TerminalPolicyStore, type TerminalAction } from "./terminal-policy.js";
 import type { NativeProcessLister } from "./native-process-lineage.js";
 import type { CurrentModelReader } from "./model-divergence/current-model-reader.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
-import type { TmuxAdapter, SessionProbe } from "../adapters/tmux.js";
+import type { TmuxAdapter, SessionProbe, StopPhase } from "../adapters/tmux.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { EFFORT_SHAPE, piThinkingValue } from "../adapters/pi-runner-protocol.js";
 import type { NodeInventoryEntry, PersistedEvent } from "./types.js";
@@ -99,6 +100,8 @@ interface ResolvedSeat {
 export interface SeatRefusal {
   ok: false;
   code:
+    | "terminal_policy_refused"
+    | "terminal_policy_unavailable"
     | "seat_ref_required"
     | "seat_not_found"
     | "seat_ambiguous"
@@ -134,7 +137,12 @@ export interface SeatRefusal {
     | "invalid_effort"
     | "effort_unsupported_runtime"
     | "effort_unavailable"
-    | "invalid_policy";
+    | "invalid_policy"
+    | "invalid_stop_precondition"
+    | "guard_unavailable"
+    | "guard_target_changed"
+    | "selection_changed"
+    | "stop_uncertain";
   message: string;
   guidance?: string;
   matches?: Array<{ rig_name: string; logical_id: string; current_occupant: string | null }>;
@@ -214,7 +222,19 @@ export type SetEffortResult =
 
 export type StopSeatResult =
   | { ok: true; seat: SeatDescriptor; sessionName: string; sessionId: string }
-  | SeatRefusal;
+  | (SeatRefusal & { partialEffect?: boolean; stopPhase?: StopPhase });
+
+/** The narrow identity reviewed before an optional checked stop. */
+export interface StopPrecondition { nodeId: string; sessionId: string | null }
+
+/** Reject malformed explicit values so they never fall through to an unchecked stop. */
+function validStopPrecondition(value: unknown): value is StopPrecondition {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).sort().join(",") === "nodeId,sessionId"
+    && typeof record.nodeId === "string" && !!record.nodeId.trim()
+    && (record.sessionId === null || typeof record.sessionId === "string" && !!record.sessionId.trim());
+}
 
 export type CleanSeatResult =
   | { ok: true; seat: SeatDescriptor; actions: { sessionsExited: string[]; bindingCleared: boolean } }
@@ -258,7 +278,7 @@ interface PersistedStartupContextRow {
   runtime: string | null;
 }
 
-interface ParsedStartupContext {
+export interface ParsedStartupContext {
   plan: ProjectionPlan;
   resolvedStartupFiles: ResolvedStartupFile[];
   startupActions: StartupAction[];
@@ -306,6 +326,48 @@ export class SeatLifecycleService {
     this.piRecords = deps.piRecords ?? null;
   }
 
+  private terminalPolicyCheck(nodeId: string, action: TerminalAction, operator?: string | null) {
+    try {
+      const decision = new TerminalPolicyStore(this.db).check(nodeId, action, { source: "caller", session: operator ?? null });
+      return { ok: true as const, ...decision };
+    } catch (error) {
+      const refusal: SeatRefusal = { ok: false, code: error instanceof TerminalPolicyRefusal ? "terminal_policy_refused" : "terminal_policy_unavailable",
+        message: (error as Error).message,
+        ...(error instanceof TerminalPolicyRefusal ? { actorClass: error.actorClass } : {}) };
+      return refusal;
+    }
+  }
+
+  setTerminalPolicy(input: { seatRef: string; preset: unknown; helpers?: unknown; exceptions?: unknown;
+    reason: string; actor: string; rigDefault?: boolean }) {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    if (!input.actor.trim()) return { ok: false as const, code: "actor_required", message: "Supply the caller identity or --operator for the audit." };
+    const resolved = this.resolveSeat(input.seatRef);
+    if ("code" in resolved) return resolved;
+    let config: ReturnType<typeof parseTerminalPolicy>;
+    try { config = parseTerminalPolicy(input); }
+    catch (error) { return { ok: false as const, code: "invalid_terminal_policy", message: (error as Error).message }; }
+    try {
+      const store = new TerminalPolicyStore(this.db);
+      const seat = this.describe(resolved);
+      let persisted: PersistedEvent | null = null;
+      this.db.transaction(() => {
+        store.write(seat.nodeId, config, input.actor.trim(), input.reason.trim(), input.rigDefault);
+        persisted = this.eventBus.persistWithinTransaction({ type: "node.terminal_policy_changed", rigId: seat.rigId,
+          nodeId: seat.nodeId, scope: input.rigDefault ? "rig_default" : "seat", config,
+          actor: input.actor.trim(), reason: input.reason.trim() });
+      })();
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+      return { ok: true as const, seat, config,
+        effect: input.rigDefault ? "Saved for newly added seats in this rig only; existing seats are unchanged."
+          : "Saved for managed compaction and future saved model/effort changes. No input, relaunch, native permission or interruption-level change.",
+        account: store.account(seat.nodeId, resolved.entry.runtime ?? null) };
+    } catch (error) {
+      return { ok: false as const, code: "terminal_policy_unavailable" as const, message: (error as Error).message };
+    }
+  }
+
   async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
@@ -325,9 +387,12 @@ export class SeatLifecycleService {
 
     let persisted: PersistedEvent | null = null;
     const tx = this.db.transaction(() => {
+      const decision = this.terminalPolicyCheck(seat.nodeId, "model", input.operator);
+      if (!decision.ok) return decision;
       this.rigRepo.setNodeModel(resolved.nodeId, model);
       persisted = this.eventBus.persistWithinTransaction({
         type: "node.model_changed",
+        actorClass: decision.actorClass,
         rigId: seat.rigId,
         nodeId: seat.nodeId,
         logicalId: seat.logicalId,
@@ -337,7 +402,8 @@ export class SeatLifecycleService {
         operator: input.operator ?? null,
       });
     });
-    tx();
+    const refused = tx();
+    if (refused) return refused;
     if (persisted) this.eventBus.notifySubscribers(persisted);
 
     return { ok: true, seat, from, to: model, changed: true };
@@ -394,7 +460,7 @@ export class SeatLifecycleService {
       if (!file.appliesOn.includes("fresh_start") || file.deliveryHint === "send_text") continue;
       try {
         const hint = file.deliveryHint === "auto"
-          ? resolveConcreteHint(file.path, fs.readFileSync(file.absolutePath, "utf8")) : file.deliveryHint;
+          ? resolveConcreteHint(file.path, fs.readFileSync(file.absolutePath, "utf8"), file.orientation) : file.deliveryHint;
         if (hint !== "send_text") files.push({ ...file, deliveryHint: hint });
       } catch (error) {
         const detail = `Startup file ${file.path}: ${(error as Error).message}`;
@@ -479,11 +545,14 @@ export class SeatLifecycleService {
     let changed = false;
     if (from.choice !== requested) {
       let persisted: PersistedEvent | null = null;
-      this.db.transaction(() => {
+      const refused = this.db.transaction(() => {
+        const decision = this.terminalPolicyCheck(seat.nodeId, "model", input.operator);
+        if (!decision.ok) return decision;
         if (!this.rigRepo.setNodeEffortChoice(seat.nodeId, requested)) return;
         changed = true;
         persisted = this.eventBus.persistWithinTransaction({
           type: "node.effort_changed",
+          actorClass: decision.actorClass,
           rigId: seat.rigId,
           nodeId: seat.nodeId,
           logicalId: seat.logicalId,
@@ -493,6 +562,7 @@ export class SeatLifecycleService {
           operator: input.operator ?? null,
         });
       })();
+      if (refused) return refused;
       if (persisted) this.eventBus.notifySubscribers(persisted);
       if (!changed) {
         return { ok: false, code: "effort_unavailable", message: `The effort choice for seat "${input.seatRef}" was not saved (no node row was updated); nothing changed.` };
@@ -702,7 +772,9 @@ export class SeatLifecycleService {
         if (currentRuntime?.runtime !== runtime) throw new Error("Seat runtime changed while checking native options; selection was not changed.");
         const from = store.read(seat.nodeId);
         const changed = from?.runtime !== to?.runtime || from?.mode !== to?.mode;
-        if (changed) {
+        // A Codex re-selection is intent for its next rebuild, even when the saved value is
+        // unchanged. Audit inherit too: a cleared selection has no row to carry its timestamp.
+        if (changed || runtime === "codex") {
           store.write(seat.nodeId, to, input.actor.trim(), input.reason.trim());
           persisted = this.eventBus.persistWithinTransaction({ type: "node.permissions_changed", rigId: seat.rigId,
             nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), source: "seat_selection", effect: "future_launches_only" });
@@ -755,7 +827,8 @@ export class SeatLifecycleService {
     const before = this.rigRepo.getNodePolicyProvenance(seat.nodeId);
     const changed = from !== ref || !before || before.origin !== provenance.origin || before.resolvedTarget !== provenance.resolvedTarget
       || before.declaringDir !== provenance.declaringDir || before.launchPosture !== provenance.launchPosture;
-    if (changed) {
+    // Reaffirming the same Codex policy is also a deliberate choice for the next rebuild.
+    if (changed || resolved.entry.runtime === "codex") {
       let persisted: PersistedEvent | null = null;
       this.db.transaction(() => {
         this.rigRepo.setNodePermissionPolicy(seat.nodeId, ref);
@@ -777,9 +850,21 @@ export class SeatLifecycleService {
     return { ok: true, seat, from, to: ref, launchPosture: attachment.launchPosture, changed, effect };
   }
 
-  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<StopSeatResult> {
+  /** Read the current node and latest session without changing seat state. */
+  stopPrecondition(seatRef: string): { contract: "seat-stop.v1"; expected: StopPrecondition } | SeatRefusal {
+    const resolved = this.resolveSeat(seatRef);
+    if ("code" in resolved) return resolved;
+    return { contract: "seat-stop.v1", expected: { nodeId: resolved.nodeId, sessionId: this.latestSession(resolved.nodeId)?.id ?? null } };
+  }
+
+  /** Stop one managed seat; an explicit expected tuple activates strict identity checks. */
+  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: unknown }): Promise<StopSeatResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
+    if ("expected" in input) {
+      if (!validStopPrecondition(input.expected)) return { ok: false, code: "invalid_stop_precondition", message: "expected must contain a nonempty nodeId and a nonempty sessionId or null." };
+      return this.stopSeatChecked(input, input.expected);
+    }
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
@@ -816,6 +901,48 @@ export class SeatLifecycleService {
     }
 
     return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true);
+  }
+
+  /** Hold the existing lifecycle lease from selection validation through terminal and DB effects. */
+  private async stopSeatChecked(
+    input: { seatRef: string; reason: string; operator?: string | null }, expected: StopPrecondition,
+  ): Promise<StopSeatResult> {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard) return { ok: false, code: "guard_unavailable", message: "Checked stop requires the delivery guard." };
+    const selection = (): SeatRefusal | null => {
+      const current = this.resolveSeat(input.seatRef);
+      if ("code" in current || current.nodeId !== expected.nodeId || (this.latestSession(current.nodeId)?.id ?? null) !== expected.sessionId) {
+        return { ok: false, code: "selection_changed", message: "The selected seat or latest session changed; review the stop precondition again." };
+      }
+      return null;
+    };
+    const initial = selection();
+    if (initial) return initial;
+    if (expected.sessionId === null) return { ok: false, code: "no_session", message: "The selected seat has no session to stop." };
+    try {
+      return await guard.lifecycle([expected.nodeId], async () => {
+        const stale = selection();
+        if (stale) return stale;
+        guard.checkInput(expected.nodeId);
+        const resolved = this.resolveSeat(input.seatRef);
+        if ("code" in resolved) return { ok: false, code: "selection_changed", message: "The selected seat changed." };
+        const seat = this.describe(resolved);
+        const session = this.latestSession(resolved.nodeId)!;
+        if (session.origin === "claimed") return { ok: false, code: "claimed_session", message: `Session "${session.session_name}" was adopted (origin=claimed), not launched by OpenRig — stop refuses to kill it.`, guidance: "Release an adopted session with: rig unclaim" };
+        const probed = await this.probeLiveness(session.session_name, "stop refuses rather than kill blind");
+        if ("code" in probed) return probed;
+        const afterProbe = selection();
+        if (afterProbe) return afterProbe;
+        guard.checkInput(resolved.nodeId);
+        if (probed.state === "absent") return { ok: false, code: "session_not_live", message: `Session "${session.session_name}" is absent in tmux; there is nothing to stop.`, guidance: "A dead seat with stale records is returned to launchable with: rig seat clean" };
+        return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true, { selection, guard });
+      });
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      return { ok: false, code: code === "guard_target_changed" || code === "guard_target_unknown" ? "selection_changed"
+        : code === "typing_guard_enabled" || code === "draft_aware_lifecycle" ? "typing_guard_enabled" : "tmux_probe_failed",
+      message: (error as Error).message };
+    }
   }
 
   async cleanSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
@@ -1192,6 +1319,7 @@ export class SeatLifecycleService {
     ).all(node.id) as Array<{ id: string }>).map((row) => row.id);
     const retiringGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
 
+    const viewWarnings: string[] = [];
     let canonicalProbe = await this.probeLiveness(
       canonicalSessionName,
       "fresh launch refuses rather than overwrite a possibly-live canonical session",
@@ -1239,6 +1367,10 @@ export class SeatLifecycleService {
         false,
       );
       if (!stopped.ok) return stopped;
+      // All tile providers attach once; the safe detach must not silently look
+      // like a seat disappearing. Report recovery without inventorying or reopening views.
+      const view = shellQuote(`rig:${seat.rigName}`);
+      viewWarnings.push(`Replacing the tmux session for "${canonicalSessionName}" detaches its open terminal tiles. Reopen the view: rig terminal open ${view} --window (Herdr or tmux), or rig terminal open ${view} --provider cmux.`);
       // Stopping the server's last session ends tmux's server, and every probe
       // below would then be transport_unavailable, never absence. Restore an
       // empty server (no session is invented; a no-op while the server is up)
@@ -1255,7 +1387,7 @@ export class SeatLifecycleService {
         reason: input.reason,
         operator: input.operator,
       });
-      if (!cleaned.ok) return cleaned;
+      if (!cleaned.ok) return { ...cleaned, warnings: viewWarnings };
     }
 
     // The stop/clean composition may have taken time; buy absence again at the
@@ -1264,11 +1396,12 @@ export class SeatLifecycleService {
       canonicalSessionName,
       "fresh launch refuses rather than race a canonical-session collision",
     );
-    if ("code" in finalProbe) return finalProbe;
+    if ("code" in finalProbe) return { ...finalProbe, warnings: viewWarnings };
     if (finalProbe.state === "present") {
       return {
         ok: false,
         code: "unmanaged_session_collision",
+        warnings: viewWarnings,
         message: `Canonical tmux session "${canonicalSessionName}" appeared before launch; refusing to overwrite it.`,
       };
     }
@@ -1287,7 +1420,7 @@ export class SeatLifecycleService {
       occupantKind: "fresh",
     });
     if (!launch.ok) {
-      return { ok: false, code: "launch_failed", message: launch.message };
+      return { ok: false, code: "launch_failed", message: launch.message, warnings: viewWarnings };
     }
     const observedGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
     const generation = observedGeneration && observedGeneration !== retiringGeneration
@@ -1309,8 +1442,8 @@ export class SeatLifecycleService {
         errors: ["new occupant generation was not persisted"],
       });
       return compensation === "zero"
-        ? { ok: false, code: "startup_failed", status: "failed", message: "Fresh launch could not persist a new occupant generation; the new session was rolled back." }
-        : { ok: false, code: "attention_required", status: "attention_required", message: "Fresh launch could not persist a new occupant generation and the new process could not be confirmed stopped; the seat requires attention.", sessionName: canonicalSessionName, sessionId: launch.session.id };
+        ? { ok: false, code: "startup_failed", status: "failed", warnings: viewWarnings, message: "Fresh launch could not persist a new occupant generation; the new session was rolled back." }
+        : { ok: false, code: "attention_required", status: "attention_required", warnings: viewWarnings, message: "Fresh launch could not persist a new occupant generation and the new process could not be confirmed stopped; the seat requires attention.", sessionName: canonicalSessionName, sessionId: launch.session.id };
     }
     this.activityOracle?.declareOccupantSwap(node.id, generation);
 
@@ -1340,6 +1473,8 @@ export class SeatLifecycleService {
       allowFreshFallback: false,
     });
 
+    const warnings = viewWarnings.length ? [...(startupResult.warnings ?? []), ...viewWarnings] : startupResult.warnings;
+
     if (!startupResult.ok && startupResult.startupStatus === "failed") {
       const compensation = await this.compensateFailedFreshLaunch({
         seat,
@@ -1361,14 +1496,14 @@ export class SeatLifecycleService {
             code: "startup_failed",
             status: "failed",
             message: `Fresh startup failed and was rolled back to zero live session/binding: ${startupResult.errors.join("; ")}`,
-            warnings: startupResult.warnings,
+            warnings,
           }
         : {
             ok: false,
             code: "attention_required",
             status: "attention_required",
             message: `Fresh startup failed and the new process could not be confirmed stopped; the seat requires attention: ${startupResult.errors.join("; ")}`,
-            warnings: startupResult.warnings,
+            warnings,
             sessionName: canonicalSessionName,
             sessionId: launch.session.id,
             generation,
@@ -1435,7 +1570,7 @@ export class SeatLifecycleService {
         sessionName: canonicalSessionName,
         sessionId: launch.session.id,
         generation,
-        warnings: startupResult.warnings,
+        warnings,
       };
     }
 
@@ -1451,7 +1586,7 @@ export class SeatLifecycleService {
       advisor: node.advisor ?? undefined,
       startupPolicyHash: startup.hash,
       supersededSessionIds,
-      warnings: startupResult.warnings,
+      warnings,
     };
   }
 
@@ -1566,15 +1701,32 @@ export class SeatLifecycleService {
 
   // -- shared internals --
 
+  /** Shared stop effects; checked calls revalidate at terminal boundaries and before persistence. */
   private async stopManagedTmuxSeat(
     resolved: ResolvedSeat,
     session: LatestSessionRow,
     reason: string,
     operator: string | null | undefined,
     recordStopIntent: boolean,
+    checked?: { selection: () => SeatRefusal | null; guard: NonNullable<TmuxAdapter["deliveryGuard"]> },
   ): Promise<StopSeatResult> {
     const seat = this.describe(resolved);
-    const kill = await this.tmuxAdapter.killSession(session.session_name);
+    const beforeEffect = checked && (() => {
+      const changed = checked.selection();
+      if (changed) throw Object.assign(new Error(changed.message), { code: changed.code });
+      checked.guard.checkInput(resolved.nodeId);
+    });
+    const kill = checked
+      ? await this.tmuxAdapter.killSession(session.session_name, beforeEffect)
+      : await this.tmuxAdapter.killSession(session.session_name);
+    if (checked && !kill.ok) {
+      const partialEffect = kill.stopPhase !== undefined && kill.stopPhase !== "none";
+      if (kill.code === "selection_changed" || kill.code === "guard_target_changed" || kill.code === "guard_target_unknown") {
+        return { ok: false, code: "selection_changed", message: kill.message, partialEffect, stopPhase: kill.stopPhase };
+      }
+      if (!partialEffect && kill.code !== "session_not_found") return { ok: false, code: "tmux_probe_failed", message: kill.message };
+      return { ok: false, code: "stop_uncertain", message: `Checked stop did not complete: ${kill.message}`, partialEffect, stopPhase: kill.stopPhase };
+    }
     if (kill && !kill.ok && kill.code !== "session_not_found") {
       return {
         ok: false,
@@ -1583,7 +1735,12 @@ export class SeatLifecycleService {
       };
     }
     let persisted: PersistedEvent | null = null;
-    const tx = this.db.transaction(() => {
+    const tx = this.db.transaction((): SeatRefusal | null => {
+      if (checked) {
+        const changed = checked.selection();
+        if (changed) return changed;
+        checked.guard.checkInput(resolved.nodeId);
+      }
       if (recordStopIntent && kill?.ok) {
         this.sessionRegistry.markIntentionallyStopped(session.id);
       } else {
@@ -1599,10 +1756,23 @@ export class SeatLifecycleService {
         reason: reason.trim(),
         operator: operator ?? null,
       });
+      return null;
     });
-    tx();
-    this.tmuxAdapter.deliveryGuard?.rebindLifecycle(resolved.nodeId);
-    if (persisted) this.eventBus.notifySubscribers(persisted);
+    try {
+      const changed = tx();
+      if (changed) return { ...changed, partialEffect: true, stopPhase: "kill_attempted" };
+    } catch (error) {
+      if (!checked) throw error;
+      if ((error as { code?: string }).code === "guard_target_changed") return { ok: false, code: "selection_changed", message: (error as Error).message, partialEffect: true, stopPhase: "kill_attempted" };
+      return { ok: false, code: "stop_uncertain", message: `Session kill completed, but stop state could not be persisted: ${(error as Error).message}`, partialEffect: true, stopPhase: "kill_attempted" };
+    }
+    try {
+      this.tmuxAdapter.deliveryGuard?.rebindLifecycle(resolved.nodeId);
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+    } catch (error) {
+      if (!checked) throw error;
+      return { ok: false, code: "stop_uncertain", message: `Session kill completed, but stop finalization failed: ${(error as Error).message}`, partialEffect: true, stopPhase: "kill_attempted" };
+    }
     return { ok: true, seat, sessionName: session.session_name, sessionId: session.id };
   }
 
@@ -1619,7 +1789,7 @@ export class SeatLifecycleService {
     return row?.resume_token?.trim() || null;
   }
 
-  private readStartupContext(
+  readStartupContext(
     nodeId: string,
     cwd: string,
   ): { ok: true; context: ParsedStartupContext } | { ok: false; refusal: SeatRefusal } {

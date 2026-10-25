@@ -1,5 +1,6 @@
+import type { ClaudeCompactionEnforcer } from "../domain/claude-compaction-enforcer.js";
 import { OutboxHandler } from "../domain/outbox-handler.js";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { RigRepository } from "../domain/rig-repository.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { DiscoveryRepository } from "../domain/discovery-repository.js";
@@ -8,6 +9,9 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import { observeClaudePaneStartedAt } from "../domain/native-process-lineage.js";
 import { SeatStatusService } from "../domain/seat-status-service.js";
 import { SeatHandoverService } from "../domain/seat-handover-service.js";
+import { SeatRuntimeSwitchService, runtimeSwitchSummary } from "../domain/seat-runtime-switch-service.js";
+import type { QueueRepository } from "../domain/queue-repository.js";
+import { OCCUPANT_GENERATION_HEADER, runtimeSwitchCustodyRefusal } from "./runtime-switch-custody.js";
 import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js";
 import { SeatLifecycleService } from "../domain/seat-lifecycle-service.js";
 import { makePredecessorRecapResolver } from "../domain/predecessor-recap-resolver.js";
@@ -23,6 +27,17 @@ import type { SessionTransport } from "../domain/session-transport.js";
 import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
 
 export const seatRoutes = new Hono();
+
+// Slice 16: a runtime switch's retired predecessor, or its staged successor before commit, doesn't act as the seat here
+// either (the queue and send's narrow check). Reads, other callers and requests without a generation go on as before;
+// the staged successor's own confirmation and a recovery are exempt.
+seatRoutes.use("*", async (c, next) => {
+  if (c.req.method === "GET" || /\/set-runtime\/[^/]+\/(confirm|recover)$/.test(c.req.path)) return next();
+  const rigRepo = c.get("rigRepo" as never) as RigRepository | undefined;
+  const refusal = rigRepo ? runtimeSwitchCustodyRefusal(rigRepo.db, transportSenderSession(c), c.req.header(OCCUPANT_GENERATION_HEADER)) : null;
+  if (refusal) return c.json(refusal.body, refusal.status);
+  return next();
+});
 
 // S09 is an independent delivery preference, never a lifecycle or permission change.
 seatRoutes.post("/set-typing-guard/:seatRef", async c => {
@@ -85,13 +100,15 @@ seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
 
 seatRoutes.get("/status/:seatRef", (c) => {
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
-  const service = new SeatStatusService({ rigRepo });
+  const service = new SeatStatusService({ rigRepo, compactionEnforcer: c.get("compactionEnforcer" as never) as ClaudeCompactionEnforcer | undefined });
   const result = service.getStatus(c.req.param("seatRef")!);
 
   if (result.ok) {
     const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
     const target = guard?.maybeTarget(c.req.param("seatRef")!);
-    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
+    const nodeId = rigRepo.getRig(result.status.rig_id)?.nodes.find((node) => node.logicalId === result.status.logical_id)?.id;
+    const runtimeSwitch = nodeId ? runtimeSwitchSummary(rigRepo.db, { nodeId }) : null;
+    return c.json({ ...result.status, ...(runtimeSwitch ? { runtimeSwitch } : {}), ...(guard && target ? { typingGuard: {
       ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
     } } : {}) });
   }
@@ -105,10 +122,11 @@ seatRoutes.get("/status/:seatRef", (c) => {
   return c.json(result, 404);
 });
 
-seatRoutes.post("/handover/:seatRef", async (c) => {
-  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+/** The handover's dependencies, which a runtime switch's successor launch shares. */
+function handoverDeps(c: Context): ConstructorParameters<typeof SeatHandoverService>[0] {
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
-  const service = new SeatHandoverService({
+  return {
+    codexPermissions: (c.get("currentModelReader" as never) as import("../domain/model-divergence/current-model-reader.js").CurrentModelReader | undefined) ?? undefined,
     db: rigRepo.db,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
@@ -194,7 +212,75 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     // declareOccupantSwap and the successor never inherits the retiree's evidence or
     // promoted rung authority. Optional in the deps contract; ALWAYS wired here.
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
+  };
+}
+
+/** Slice 16: the live runtime switch, sharing the handover's dependencies. */
+function runtimeSwitchService(c: Context): SeatRuntimeSwitchService {
+  const instantiator = c.get("podInstantiator" as never) as { runtimeSwitchMaterialContext?: () => { skillsRoot?: string; systemSkills?: string[]; systemWorldError?: string } } | undefined;
+  return new SeatRuntimeSwitchService({ ...handoverDeps(c), queueRepo: c.get("queueRepo" as never) as QueueRepository | undefined,
+    materialResolution: instantiator?.runtimeSwitchMaterialContext?.(), openrigHome: OPENRIG_HOME });
+}
+
+const RUNTIME_SWITCH_STATUS: Record<string, number> = {
+  invalid_runtime_settings: 400, seat_ref_required: 400, seat_not_found: 404, runtime_target_unavailable: 422,
+};
+
+seatRoutes.post("/set-runtime/:seatRef", async (c) => {
+  const parsed: unknown = await c.req.json().catch(() => ({}));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return c.json({ ok: false, code: "invalid_runtime_settings", message: "The request must be a JSON object." }, 400);
+  }
+  const body = parsed as Record<string, unknown>;
+  const text = (key: string): string | undefined | null => body[key] === undefined ? undefined : typeof body[key] === "string" ? body[key] as string : null;
+  const fields = { runtime: text("runtime"), reason: text("reason"), model: text("model"), effort: text("effort"),
+    codexConfigProfile: text("codexConfigProfile"), permissionMode: text("permissionMode") };
+  const wrong = Object.entries(fields).find(([, value]) => value === null);
+  if (wrong) return c.json({ ok: false, code: "invalid_runtime_settings", message: `${wrong[0]} must be a string.` }, 400);
+  if (body["dryRun"] !== undefined && typeof body["dryRun"] !== "boolean") {
+    return c.json({ ok: false, code: "invalid_runtime_settings", message: "dryRun must be true or false." }, 400);
+  }
+  const timeout = body["confirmTimeoutSeconds"];
+  if (timeout !== undefined && (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 10 || timeout > 3600)) {
+    return c.json({ ok: false, code: "invalid_runtime_settings", message: "confirmTimeoutSeconds must be a whole number from 10 to 3600." }, 400);
+  }
+  const result = await runtimeSwitchService(c).setRuntime({
+    seatRef: c.req.param("seatRef")!, runtime: fields.runtime ?? "", reason: fields.reason ?? "",
+    requestedBy: transportSenderSession(c) ?? null, dryRun: body["dryRun"] === true,
+    ...(fields.model ? { model: fields.model } : {}), ...(fields.effort ? { effort: fields.effort } : {}),
+    ...(fields.codexConfigProfile ? { codexConfigProfile: fields.codexConfigProfile } : {}),
+    ...(fields.permissionMode ? { permissionMode: fields.permissionMode } : {}),
+    ...(typeof timeout === "number" ? { confirmTimeoutMs: timeout * 1000 } : {}),
   });
+  if (result.ok) return c.json(result, "recoveryPending" in result && result.recoveryPending ? 202 : 200);
+  return c.json(result, (RUNTIME_SWITCH_STATUS[result.code] ?? 409) as 400);
+});
+
+// The staged successor's confirmation: only its own reserved generation (the caller's X-OpenRig-Occupant-Generation).
+seatRoutes.post("/set-runtime/:seatRef/confirm", async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
+  const result = runtimeSwitchService(c).confirm({
+    seatRef: c.req.param("seatRef")!, switchId: typeof body["switchId"] === "string" ? body["switchId"] : "",
+    note: typeof body["note"] === "string" ? body["note"] : "", actorSession: transportSenderSession(c) ?? null,
+    generation: c.req.header(OCCUPANT_GENERATION_HEADER) ?? null,
+  });
+  return result.ok ? c.json(result) : c.json(result, 409);
+});
+
+seatRoutes.post("/set-runtime/:seatRef/recover", async (c) => {
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  const status = new SeatStatusService({ rigRepo }).getStatus(c.req.param("seatRef")!);
+  if (!status.ok) return c.json(status, status.code === "seat_ambiguous" ? 409 : status.code === "seat_ref_required" ? 400 : 404);
+  const nodeId = rigRepo.getRig(status.status.rig_id)?.nodes.find((node) => node.logicalId === status.status.logical_id)?.id;
+  if (!nodeId) return c.json({ ok: false, code: "seat_not_found", message: `No seat ${c.req.param("seatRef")}.` }, 404);
+  const result = await runtimeSwitchService(c).recover(nodeId);
+  return result.ok ? c.json(result) : c.json(result, 409);
+});
+
+
+seatRoutes.post("/handover/:seatRef", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const service = new SeatHandoverService(handoverDeps(c));
   const result = await service.handover({
     seatRef: c.req.param("seatRef")!,
     reason: typeof body["reason"] === "string" ? body["reason"] : null,
@@ -262,7 +348,7 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
 function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required"
     || code === "missing_effort" || code === "invalid_effort" || code === "invalid_policy"
-    || code === "missing_cwd" || code === "invalid_cwd") return 400;
+    || code === "missing_cwd" || code === "invalid_cwd" || code === "invalid_stop_precondition") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;
   if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed"
@@ -271,6 +357,16 @@ function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   // nothing_to_clean — state conflicts, not client syntax errors.
   return 409;
 }
+
+seatRoutes.post("/set-terminal-policy/:seatRef", async c => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
+  const actor = transportSenderSession(c) ?? (typeof body.operator === "string" ? body.operator : "");
+  if (body.rigDefault !== undefined && typeof body.rigDefault !== "boolean") return c.json({ error: "rigDefault must be boolean" }, 400);
+  const result = seatLifecycleService(c).setTerminalPolicy({ seatRef: c.req.param("seatRef"),
+    preset: body.preset, helpers: body.helpers, exceptions: body.exceptions,
+    reason: typeof body.reason === "string" ? body.reason : "", actor, rigDefault: body.rigDefault === true });
+  return c.json(result, result.ok ? 200 : result.code === "invalid_terminal_policy" || result.code === "actor_required" ? 400 : seatLifecycleStatus(result.code));
+});
 
 seatRoutes.post("/set-permissions/:seatRef", async (c) => {
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
@@ -302,7 +398,7 @@ seatRoutes.post("/set-model/:seatRef", async (c) => {
     seatRef: c.req.param("seatRef")!,
     model: typeof body["model"] === "string" ? body["model"] : "",
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
-    operator: typeof body["operator"] === "string" ? body["operator"] : null,
+    operator: transportSenderSession(c) ?? (typeof body["operator"] === "string" ? body["operator"] : null),
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));
@@ -330,7 +426,7 @@ seatRoutes.post("/set-effort/:seatRef", async (c) => {
     seatRef: c.req.param("seatRef")!,
     effort: clear ? null : typeof body["effort"] === "string" ? body["effort"] : "",
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
-    operator: typeof body["operator"] === "string" ? body["operator"] : null,
+    operator: transportSenderSession(c) ?? (typeof body["operator"] === "string" ? body["operator"] : null),
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));
@@ -397,12 +493,18 @@ seatRoutes.post("/continue/:seatRef", async (c) => {
   return c.json(result, result.ok ? 200 : 409);
 });
 
+seatRoutes.get("/stop-precondition/:seatRef", c => {
+  const result = seatLifecycleService(c).stopPrecondition(c.req.param("seatRef")!);
+  return "contract" in result ? c.json(result) : c.json(result, seatLifecycleStatus(result.code));
+});
+
 seatRoutes.post("/stop/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
   const result = await seatLifecycleService(c).stopSeat({
     seatRef: c.req.param("seatRef")!,
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
     operator: typeof body["operator"] === "string" ? body["operator"] : null,
+    ...(Object.prototype.hasOwnProperty.call(body, "expected") ? { expected: body["expected"] } : {}),
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));

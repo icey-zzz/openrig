@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
@@ -21,7 +22,7 @@ export const USAGE_ACROSS_HOSTS_REFRESH_TIMEOUT_MS = 75_000;
 
 export function providerCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("provider").description(
-    "Provider accounts, usage signals, and interruption-safe account switching",
+    "Provider accounts and usage signals, plus a switch precheck (switching itself isn't carried out yet)",
   );
   const getDeps = (): StatusDeps =>
     depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
@@ -138,12 +139,16 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
       const c = (r["configured"] ?? {}) as Record<string, unknown>;
       const configured = c["source"] === "registry"
         ? `configured: profile ${c["profileRef"]} (registry, recorded ${c["recordedAt"]}${c["profileSaved"] === false ? "; profile not saved on this host" : c["profileSaved"] === null ? "; whether the profile is saved: unknown" : ""})`
+        : c["source"] === "default_login" && c["homeFrom"]
+          ? `configured: the seat's own home (${c["home"]}, from its ${c["homeFrom"]} env)`
         : c["source"] === "default_login"
           ? `configured: default login${c["home"] ? ` (${c["home"]})` : ""}`
           : `configured: unknown (${c["reason"]})`;
       const allowance = (r["allowance"] ?? {}) as Record<string, unknown>;
       console.log(`  ${r["seatSession"]}  ${r["runtime"]}  ${configured} · allowance not linked`);
       if (c["source"] === "default_login" && c["homeNote"]) console.log(`    ${c["homeNote"]}`);
+      const ignored = r["ignoredHome"] as Record<string, unknown> | undefined;
+      if (ignored) console.log(`    ignored: its ${ignored["from"]} env sets ${ignored["variable"]}=${ignored["value"]}, which isn't an absolute path, so it isn't used as this seat's home`);
       for (const note of (r["registryNotes"] as string[] | undefined) ?? []) console.log(`    ${note}`);
       const observed = r["observed"] as Record<string, unknown> | undefined;
       const differs = (observed?.["differsFrom"] as string[] | undefined) ?? [];
@@ -164,7 +169,7 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
   function identityLabel(id: Record<string, unknown>): string {
     // Codex: account, else the workspace account/read reported; Claude: the organisation and email auth status
     // reported at the last refresh; else unresolved. For Codex the email is a label.
-    return id["accountId"] ? `account ${id["accountId"]}`
+    return id["source"] === "configured credential label" ? `credential ${id["credentialLabel"]} (operator label)` : id["accountId"] ? `account ${id["accountId"]}`
       : id["workspaceId"] ? `workspace ${id["workspaceId"]} (from account/read; no usage account id)`
         : id["source"] !== "unresolved" && id["orgId"] ? `organisation ${id["orgName"] ? `${id["orgName"]} (${id["orgId"]})` : id["orgId"]}`
           : "identity unresolved";
@@ -216,6 +221,7 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
       : id["source"] === "unresolved" ? "  [from an earlier read; possibly this same login]"
         : "  [from an earlier read; the latest read didn't match this row]";
     console.log(`${pad}${r["provider"]}  ${labels.join(" · ")}${earlier}`);
+    if (r["probe"]) console.log(`${pad}  token probe: ${JSON.stringify(r["probe"])}`);
     if (r["identityNote"]) console.log(`${pad}  ${r["identityNote"]}`);
     const unresolved = r["unresolved"] as Record<string, unknown> | undefined;
     if (unresolved) {
@@ -227,7 +233,7 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
       const level = w["levelReason"] ? `${w["level"]} (${w["levelReason"]})` : String(w["level"]);
       const fresh = w["freshnessReason"] ? `${w["freshness"]}: ${w["freshnessReason"]}` : String(w["freshness"]);
       const seat = w["seatSession"] ? ` by seat ${w["seatSession"]}` : "";
-      console.log(`${pad}  ${windowName(w)}  ${left}  ${level}  resets ${w["resetsAt"] ?? "unknown"}  observed ${w["observedAt"]}${seat} (${fresh})`);
+      console.log(`${pad}  ${windowName(w)}  ${left}  ${level}  resets ${w["resetsAt"] ?? "unknown"}  observed ${w["observedAt"]}${seat} (${fresh})${w["status"] ? ` · provider ${w["status"]}` : ""}`);
       for (const d of (w["disagreeingSeats"] as Array<Record<string, unknown>> | undefined) ?? []) {
         console.log(`${pad}    seat ${d["seatSession"]} reports ${Math.max(0, 100 - Number(d["usedPercent"]))}% left  resets ${d["resetsAt"] ?? "unknown"}  observed ${d["observedAt"]}`);
       }
@@ -240,7 +246,7 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
     const last = r["lastRefresh"] as Record<string, unknown> | null;
     if (last?.["outcome"] === "failed") {
       // Claude's refresh reads identity only; its windows keep coming from the seats' samples.
-      console.log(r["provider"] === "claude"
+      console.log(r["provider"] === "claude" && (r["source"] as Record<string, unknown> | undefined)?.["kind"] !== "claude_token_probe"
         ? `${pad}  identity refresh failed at ${last["at"]}: ${failureText(last)}; the identity shown is from the last refresh that worked, if any`
         : `${pad}  refresh failed at ${last["at"]}: ${failureText(last)}; last reading kept, marked old`);
     }
@@ -368,14 +374,22 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
     .option("--json", "Output as parseable JSON")
     .option("--refresh", "First read the Codex login's usage windows and the Claude login's identity natively (up to 35 s here, 75 s with --all-hosts/--hosts; provider.usage_windows is off by default: rig config set provider.usage_windows true)")
     .option("--provider <p>", "With --refresh, read only this provider (codex|claude)")
+    .option("--claude-token-file <path>", "With --refresh --provider claude, probe this absolute token-file reference on the selected daemon (one model turn; no token value in argv)")
+    .option("--credential-label <label>", "Operator label for the selected Claude token file; not provider-observed account identity")
     .option("--all-hosts", "Usage windows across every registered host, as each host already holds them (off by default: rig config set provider.usage_windows true)")
     .option("--hosts <ids>", "Like --all-hosts, for these registered hosts (comma-separated); this host is always included, so --hosts b --refresh also reads this daemon")
-    .action(async (opts: { json?: boolean; refresh?: boolean; provider?: string; allHosts?: boolean; hosts?: string }) => {
+    .action(async (opts: { json?: boolean; refresh?: boolean; provider?: string; allHosts?: boolean; hosts?: string; claudeTokenFile?: string; credentialLabel?: string }) => {
       if (opts.provider !== undefined && opts.provider !== "codex" && opts.provider !== "claude") {
         console.error(`--provider must be codex or claude (got ${opts.provider})`);
         process.exitCode = 1;
         return;
       }
+      const tokenSelected = opts.claudeTokenFile !== undefined || opts.credentialLabel !== undefined;
+      if (tokenSelected && (!opts.claudeTokenFile || !opts.credentialLabel || !opts.refresh || opts.provider !== "claude" || opts.allHosts || opts.hosts !== undefined)) {
+        console.error("A token probe requires --refresh --provider claude --claude-token-file <absolute path> --credential-label <label>, on one daemon (no --all-hosts/--hosts).");
+        process.exitCode = 1; return;
+      }
+      if (tokenSelected) console.error("Claude token usage refresh spends one model turn; timeout or refusal does not prove no allowance was consumed.");
       const client = await getClient(getDeps());
       if (!client) {
         process.exitCode = 1;
@@ -394,7 +408,7 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
         const providers = opts.provider ? [opts.provider] : ["codex", "claude"];
         const answered = await Promise.all(providers.map(async (provider) => ({
           provider,
-          answer: await client.post<Record<string, unknown>>("/api/provider/usage/refresh", { provider }, { timeoutMs: 60_000 }),
+          answer: await client.post<Record<string, unknown>>("/api/provider/usage/refresh", { provider, ...(tokenSelected ? { claudeToken: { label: opts.credentialLabel, tokenFile: opts.claudeTokenFile } } : {}) }, { timeoutMs: 60_000 }),
         })));
         // Bare --refresh keeps main's Codex exit: Claude is read too, but where it doesn't apply on this host
         // (no claude, no login, not a subscription login), or the daemon has no Claude refresh (400/404, an
@@ -477,10 +491,10 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
 
   cmd
     .command("switch")
-    .description("Switch a seat to an account (precheck-gated; the daemon orchestrates the switch)")
+    .description("Request a seat's switch to an account. Not carried out yet: the daemon runs the precheck and answers failed_safely (reasons in --json), so no account changes")
     .requiredOption("--seat <s>", "The seat session")
     .requiredOption("--to-account <a>", "The target account ref")
-    .option("--force-unsafe", "Override a non-stranding precheck failure (still refuses to strand a live conversation)")
+    .option("--force-unsafe", "Skip the precheck's refusal; the switch still isn't carried out (switch_execution_not_yet_wired)")
     .option("--json", "Output as parseable JSON")
     .action(async (opts: { seat: string; toAccount: string; forceUnsafe?: boolean; json?: boolean }) => {
       const client = await getClient(getDeps());
@@ -497,6 +511,100 @@ export function providerCommand(depsOverride?: StatusDeps): Command {
       if (opts.json) console.log(JSON.stringify(res.data));
       else console.log(res.data.outcome ?? "unknown");
       if (res.data.outcome === "failed_safely") process.exitCode = 1;
+    });
+
+  // Slice 18 — subscription move reports: what the agent that moved a Codex home reports, kept as queue items tagged
+  // subscription-move. Reading them back answers "why did these seats move?"; the Fleet app reads the same route.
+  type MoveEntry = {
+    qitemId: string; reportedAt: string; reportedTo: string; followedBy: string[];
+    report: { host: string; home: string; from: string; to: string; reason: string; follows?: string; seats: Array<{ seat: string; result: string; missing?: string }>; peers?: Array<{ seat: string; note: string }> };
+  };
+  const moves = cmd
+    .command("moves")
+    .description("Recent subscription move reports on this daemon, newest first: from and to, why, and each seat's result")
+    .option("--seat <seat>", "Only reports that restarted or listed this seat, among the reports read")
+    .option("--limit <n>", "How many of the newest reports to read, before --seat filters them (default 50, at most 200)")
+    .option("--json", "Output as parseable JSON")
+    .action(async (opts: { seat?: string; limit?: string; json?: boolean }) => {
+      const client = await getClient(getDeps());
+      if (!client) {
+        process.exitCode = 1;
+        return;
+      }
+      const qs = new URLSearchParams();
+      if (opts.seat) qs.set("seat", opts.seat);
+      if (opts.limit) qs.set("limit", opts.limit);
+      const res = await client.get<{ moves: MoveEntry[]; unreadable: Array<{ qitemId: string; reason: string }>; truncated: boolean }>(
+        `/api/provider/moves${qs.toString() ? `?${qs.toString()}` : ""}`,
+      );
+      if (handleHttpError(res, "moves")) return;
+      if (opts.json) {
+        console.log(JSON.stringify(res.data));
+        return;
+      }
+      const { moves: entries, unreadable, truncated } = res.data;
+      if (entries.length === 0) console.log("No subscription move reports.");
+      for (const { qitemId, reportedAt, reportedTo, followedBy, report } of entries) {
+        console.log(`${reportedAt}  ${qitemId}  ${report.host} ${report.home}: ${report.from} → ${report.to} (to ${reportedTo})`);
+        console.log(`  why: ${report.reason}`);
+        for (const seat of report.seats) console.log(`  ${seat.seat}: ${seat.result}${seat.missing ? `; missing: ${seat.missing}` : ""}`);
+        for (const peer of report.peers ?? []) console.log(`  ${peer.seat}: ${peer.note}`);
+        if (report.follows) console.log(`  follows ${report.follows}`);
+        if (followedBy.length > 0) console.log(`  followed by ${followedBy.join(", ")}`);
+      }
+      for (const item of unreadable) console.log(`unreadable: ${item.qitemId}: ${item.reason}`);
+      if (truncated) console.log(`(only the newest ${opts.limit ?? 50} reports were read; older ones may exist: raise --limit)`);
+    });
+  moves
+    .command("report")
+    .description("File a report of a move you made or attempted, as a queue item to whoever asked (it moves nothing)")
+    .requiredOption("--file <path>", "The report as JSON, or - for stdin")
+    .requiredOption("--to <seat>", "Who gets the report: whoever asked for the move, or the person")
+    .option("--follows <qitemId>", "The earlier report this one follows up (sets the report's follows)")
+    .option("--evidence-ref <ref>", "The evidence a report to a person's seat names, e.g. the saved --verify output")
+    .option("--json", "Output as parseable JSON")
+    .addHelpText("after", `
+The report (version 1):
+  { "version": 1, "host": "<machine>", "home": "<CODEX_HOME>", "from": "<subscription label>", "to": "<subscription label>",
+    "reason": "<why, in your words>",
+    "policy": { "ref": "account-policy", "version": "<manifest version>" }   (or { "none": true })
+    "readings": [{ "subject": "<allowance>", "basis": "observed", "observedAt": "<when observed>", "summary": "<what it said>" },
+                 { "subject": "<allowance>", "basis": "expected", "expectedFullSince": "<the reset>", "summary": "..." }],
+    "seats": [{ "seat": "<seat>", "result": "moved",
+                "accountEvidence": { "state": "matched", "detail": "<Account line>", "at": "<time>" },
+                "toolTurn": { "state": "observed", "at": "<time>" } },
+              { "seat": "<seat>", "result": "unconfirmed", "missing": "<what wasn't seen>" }],
+    "peers": [{ "seat": "<seat>", "note": "not restarted; account unverified" }] }
+moved needs accountEvidence matched and toolTurn observed, as rig seat restart --verify reports them; until both are
+seen, report the seat unconfirmed (or unknown) with what's missing. An expected reading (slice 01's expectation after
+a reset) stays labelled expected. Labels and references only: a value in a recognized credential format is refused.
+A refused report records nothing and changes nothing about the move: correct it and file it again; never repeat the
+switch or restart because a report was refused.`)
+    .action(async (opts: { file: string; to: string; follows?: string; evidenceRef?: string; json?: boolean }, command: Command) => {
+      const json = opts.json || command.parent?.opts().json;
+      let report: unknown;
+      try {
+        report = JSON.parse(opts.file === "-" ? fs.readFileSync(0, "utf8") : fs.readFileSync(opts.file, "utf8"));
+      } catch {
+        console.error(`Could not read a JSON report from ${opts.file}. Nothing was recorded, and the move itself is unchanged.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.follows && report && typeof report === "object" && !Array.isArray(report)) report = { ...report, follows: opts.follows };
+      const client = await getClient(getDeps());
+      if (!client) {
+        process.exitCode = 1;
+        return;
+      }
+      const res = await client.post<{ qitemId?: string; errors?: string[] }>("/api/provider/moves", {
+        to: opts.to, report, ...(opts.evidenceRef ? { evidenceRef: opts.evidenceRef } : {}),
+      });
+      if (res.status < 400 && json) console.log(JSON.stringify(res.data));
+      else if (res.status < 400) console.log(`Filed ${res.data.qitemId} to ${opts.to}`);
+      else {
+        for (const error of res.data.errors ?? []) console.error(`- ${error}`);
+        handleHttpError(res, "move report");
+      }
     });
 
   return cmd;

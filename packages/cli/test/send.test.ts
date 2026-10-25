@@ -232,6 +232,47 @@ describe("Send CLI", () => {
     expect(logs.join("\n")).toContain("Sent to dev-impl@my-rig");
   });
 
+  it("a terminal seat: sends exactText beside the envelope, prints the note, and --verify checks the exact text", async () => {
+    const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
+    let captures = 0;
+    const client = {
+      post: async (path: string, body: Record<string, unknown>) => {
+        posts.push({ path, body });
+        if (path === "/api/transport/capture") {
+          captures += 1;
+          return { status: 200, data: { ok: true, content: captures === 1 ? "❯ make test" : "❯ " } };
+        }
+        if (body["submitOnly"]) return { status: 200, data: { ok: true, submitOnly: true } };
+        return { status: 200, data: { ok: true, sessionName: "infra-ui@term-rig", verified: true, outcome: "delivered", envelopeOmitted: true } };
+      },
+    } as unknown as DaemonClient;
+
+    const { logs } = await captureLogs(async () => {
+      await makeCmd({ ...runningDeps(port), clientFactory: () => client }).parseAsync([
+        "node", "rig", "send", "infra-ui@term-rig", "make test", "--verify",
+      ]);
+    });
+
+    const sends = posts.filter((p) => p.path === "/api/transport/send");
+    // An older daemon ignores exactText and still types the enveloped text.
+    expect(sends[0]!.body["text"]).toContain("From: sender@my-rig");
+    expect(sends[0]!.body["exactText"]).toBe("make test");
+    // The staged check and its one guarded Enter look for what the terminal seat was given.
+    const submit = sends.find((p) => p.body["submitOnly"]);
+    expect(submit?.body["expectedStagedText"]).toBe("make test");
+    const output = logs.join("\n");
+    expect(output).toContain("Sent to infra-ui@term-rig");
+    expect(output).toContain("Note: sent as exact text, without the From/To envelope, because infra-ui@term-rig is a terminal seat.");
+  });
+
+  it("--raw sends no exactText", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "/help", "--raw"]);
+    });
+    expect(lastSendBody!["text"]).toBe("/help");
+    expect(lastSendBody!["exactText"]).toBeUndefined();
+  });
+
   it.each(["", "  \t\n"])("refuses an empty or whitespace-only direct message before transport", async (message) => {
     const { logs, exitCode } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", message]);
@@ -589,6 +630,24 @@ describe("Send CLI", () => {
     }
   });
 
+  it("send --urgent marks the message urgent; without it nothing is marked", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "the build is red", "--urgent"]);
+    });
+    expect(lastSendBody?.urgent).toBe(true);
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "routine"]);
+    });
+    expect("urgent" in (lastSendBody ?? {})).toBe(false);
+  });
+
+  it("send --urgent --dangerously-interact posts the exact answer with both marks; the daemon keeps the label out of the keys", async () => {
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "pick 1", "--urgent"]);
+    });
+    expect(lastSendBody).toMatchObject({ text: "1", dangerouslyInteract: true, urgent: true });
+  });
+
   it("send --dangerously-interact --reason posts the override fields with raw (exact) text", async () => {
     await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "unblock stuck prompt"]);
@@ -597,6 +656,29 @@ describe("Send CLI", () => {
     expect(lastSendBody?.reason).toBe("unblock stuck prompt");
     expect(lastSendBody?.text).toBe("1"); // implies --raw: no envelope
     expect("actorSession" in (lastSendBody ?? {})).toBe(true);
+  });
+
+  it("explicit unchecked interaction is forwarded, and cannot be used as an ordinary send", async () => {
+    const args = ["node", "rig", "send", "dev-impl@my-rig", "1", "--type-without-checking"];
+    expect((await captureLogs(() => makeCmd().parseAsync(args).then(() => {}))).exitCode).toBe(1);
+    expect(lastSendBody).toBeNull();
+    await captureLogs(() => makeCmd().parseAsync([...args, "--dangerously-interact", "--reason", "deliberate input"]).then(() => {}));
+    expect(lastSendBody).toMatchObject({ dangerouslyInteract: true, typeWithoutChecking: true, text: "1" });
+  });
+
+  it("shows typed input separately from suggestions to the caller, escaping control bytes", async () => {
+    const existingInput = { classification: "typed_or_pasted", rows: ["私の下書き😀\n\u001b[31m"], suggestionRows: ["suggested next"],
+      cursor: { x: 3, y: 2, width: 120, height: 40 }, fullContentsVisible: false };
+    const post = vi.fn(async () => ({ status: 409, data: { ok: false, existingInput, error: "Nothing typed. Deliberately clear, then retry." } }));
+    const result = await captureChannels(() => makeCmd(runningDeps(port, () => ({ post } as unknown as DaemonClient)))
+      .parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--dangerously-interact", "--reason", "inspect"]).then(() => {}));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("typed or pasted; author unknown");
+    expect(result.stderr.join("\n")).toContain(JSON.stringify(existingInput.rows));
+    expect(result.stderr.join("\n")).toContain("Suggestion rows (display only)");
+    expect(result.stderr.join("\n")).not.toContain("\u001b");
+    expect(post).toHaveBeenCalledTimes(1); // No retry and no capture text sent back to the seat.
+    expect(JSON.stringify(post.mock.calls)).not.toContain("suggested next");
   });
 
   it("send --dangerously-interact without --reason is rejected before contacting the daemon", async () => {
@@ -626,17 +708,31 @@ describe("Send CLI", () => {
       crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; },
     };
     await captureLogs(async () => {
-      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--host", "vm-test", "--raw", "--dangerously-interact", "--reason", "why now"]);
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "1", "--host", "vm-test", "--raw", "--dangerously-interact", "--type-without-checking", "--reason", "why now"]);
     });
     expect(captured).not.toBeNull();
     const argv = captured as unknown as string[];
     expect(argv).toContain("--raw");
     expect(argv).toContain("--dangerously-interact");
+    expect(argv).toContain("--type-without-checking");
     const ri = argv.indexOf("--reason");
     expect(ri).toBeGreaterThan(-1);
     expect(argv[ri + 1]).toBe("why now");
   });
 
+
+  it("send --host over ssh forwards --urgent, so the remote seat's level sees the mark", async () => {
+    let captured: readonly string[] | null = null;
+    const deps: SendDeps = {
+      ...runningDeps(port),
+      hostRegistryLoader: () => ({ ok: true, registry: { hosts: [{ id: "vm-test", transport: "ssh", target: "vm.local" }] } }),
+      crossHostRun: async (_host, argv) => { captured = argv; return { ok: true, stdout: "remote ok", stderr: "" }; },
+    };
+    await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "the build is red", "--host", "vm-test", "--urgent"]);
+    });
+    expect(captured).toContain("--urgent");
+  });
 
   it.each(["\r", "\x1b", "\t", " "])("preserves an explicit interaction byte in SSH argv (%#)", async answer => {
     let captured: readonly string[] = [];
@@ -938,9 +1034,10 @@ describe("Send CLI", () => {
 
   it("fan-out --dangerously-interact --reason plumbs the danger fields (bare text, no envelope)", async () => {
     await captureLogs(async () => {
-      await makeCmd().parseAsync(["node", "rig", "send", "--to", "dev-impl@my-rig,dev-qa@my-rig", "1", "--dangerously-interact", "--reason", "drive stuck prompts"]);
+      await makeCmd().parseAsync(["node", "rig", "send", "--to", "dev-impl@my-rig,dev-qa@my-rig", "1", "--dangerously-interact", "--type-without-checking", "--reason", "drive stuck prompts"]);
     });
     expect(lastBroadcastBody?.dangerouslyInteract).toBe(true);
+    expect(lastBroadcastBody?.typeWithoutChecking).toBe(true);
     expect(lastBroadcastBody?.reason).toBe("drive stuck prompts");
     expect(lastBroadcastBody?.text).toBe("1");
     expect("envelopeSender" in (lastBroadcastBody ?? {})).toBe(false);

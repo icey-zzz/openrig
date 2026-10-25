@@ -33,6 +33,7 @@ import type { DiscoveryRepository } from "./domain/discovery-repository.js";
 import type { ClaimService } from "./domain/claim-service.js";
 import type { SelfAttachService } from "./domain/self-attach-service.js";
 import { rigsRoutes } from "./routes/rigs.js";
+import { OPERATION_CONTRACT, OPERATION_KINDS } from "./domain/operation-correlation.js";
 import { sessionsRoutes, nodesRoutes, sessionAdminRoutes } from "./routes/sessions.js";
 import { adaptersRoutes } from "./routes/adapters.js";
 import { eventsRoute } from "./routes/events.js";
@@ -160,6 +161,8 @@ export interface AppDeps {
   /** Seat-scoped explicit fresh launch composes the same startup owner as rig launch. */
   startupOrchestrator?: import("./domain/startup-orchestrator.js").StartupOrchestrator;
   tmuxAdapter: TmuxAdapter;
+  /** Shared process census used by startup observations and native lineage checks. */
+  listProcesses?: import("./domain/native-process-lineage.js").NativeProcessLister;
   /** OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, exposed to
    *  the seat-handover route so a fresh successor gets launch-only defaults. */
   tmuxOptionDefaults?: TmuxOptionDefaultsApplier;
@@ -513,6 +516,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("nodeLauncher" as never, deps.nodeLauncher);
     c.set("startupOrchestrator" as never, deps.startupOrchestrator);
     c.set("tmuxAdapter" as never, deps.tmuxAdapter);
+    c.set("listProcesses" as never, deps.listProcesses);
     c.set("tmuxOptionDefaults" as never, deps.tmuxOptionDefaults);
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
@@ -729,6 +733,7 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.route("/api/rigs", rigsRoutes);
+  app.get("/api/operations/capabilities", (c) => c.json({ contract: OPERATION_CONTRACT, kinds: OPERATION_KINDS }));
   app.route("/api/rigs/:rigId/sessions", sessionsRoutes);
   // Slice 24 — per-rig CMUX workspace launcher.
   app.route("/api/rigs/:rigId/cmux", rigCmuxRoutes);

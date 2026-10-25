@@ -88,6 +88,39 @@ Readiness has its own attention codes (`runtime-adapter.ts:74–87`):
 When `checkReady` reports one, the readiness wait returns at once and startup
 ends `attention_required`.
 
+### Evidence for a failed Claude resume
+
+Previously, a failed Claude launch recorded its error without the probe code or
+the captured input's identity, and a refused strict full-restore attention clear
+had no corresponding refusal event. Probe-backed Claude launch failures now
+carry an optional `probe` in `HarnessLaunchResult` and `node.startup_failed`.
+Strict full-restore refusals emit `seat.attention_clear_refused`; a
+`pane_not_usable` refusal includes that probe and the restore attempt ID.
+A missing strict reconciler emits `strict_reconciler_unavailable` without
+inventing an attempt ID or probe evidence, and still refuses the clear.
+
+`native-resume-probe-evidence.ts` records the status, code, a closed-set login
+refusal and row kind when matched, and the exact capture's line count, byte
+count and SHA-256. Its new fields contain no captured pane text or free-form
+probe detail. Existing attention evidence and recovery decisions keep their
+previous behavior. MCP approval detection still takes precedence over the
+login-refusal check.
+
+Pane dimensions are optional, observed after the capture. Their read has a
+250 ms deadline so a hung `listPanes` cannot indefinitely delay the failure
+result or its event. On timeout, error, ambiguous pane identity or invalid
+dimensions, the unavailable dimensions are `null`; late results are ignored.
+The deadline bounds this diagnostic wait, not the underlying tmux command.
+
+`native-resume-probe-evidence.test.ts` covers unavailable and late geometry;
+`startup-orchestrator.test.ts` and `restore-orchestrator.test.ts` exercise the
+real adapter/orchestrator and SQLite event paths with available, failing and
+never-settling geometry reads. `seat-attention-reconciler.test.ts` checks that
+a missing strict reconciler records its refusal without changing restore
+history or sending input. These use synthetic terminal captures, not a
+live Claude session. The stub scenario runtime cannot draw Claude's native
+login-refusal UI, and its scenario runner does not bind the restore action.
+
 ## 2. The runtime adapters
 
 **5** classes implement `RuntimeAdapter`
@@ -322,6 +355,20 @@ provider takes the first of Herdr, then cmux, that is available and alive,
 and stays on Herdr when neither is (`providerNameFor`,
 `terminal-service.ts:175`); a named provider is used as named. These place existing tmux
 sessions in views; they do not launch harnesses.
+
+`RexAdapter` (`rex-adapter.ts`) opens a view as a new Rex session through
+the `rex` CLI (`rex --autostart=false api call <method> -`, `rex-transport.ts`):
+it creates an empty session (`session.create`), adds one window per grid page
+(`session.new_window`), and checks the tiles once after a short wait. It is used only when named;
+the CLI and TUI name it when they run inside Rex (`openRexView`,
+`packages/cli/src/terminal-window-rex.ts`), and an omitted provider never picks
+it. It refuses with `rex_unavailable` when the Rex server does not answer.
+Discovery (`server.version` and `server.status`) has a 1 s budget, and
+`status()` and `liveness()` share one probe. A request whose reply is lost (a
+timeout, a killed client, an unreadable reply) is `unknown`, not failed: the
+adapter never closes a session on it and reports `rex_outcome_unknown`.
+Herdr and Rex build their layout trees from one grid helper
+(`buildTileGrid`, `tile-layout.ts`).
 
 ## 3. Resume honesty
 

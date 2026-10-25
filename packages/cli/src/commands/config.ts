@@ -11,7 +11,7 @@ function summarizeSettings(store: ConfigStore): Record<ValidKey, ResolvedSetting
 }
 
 // These settings remain boot-only; capture interval/line settings reload live.
-const BOOT_ONLY_KEYS = ["daemon.port", "daemon.host", "db.path"];
+const BOOT_ONLY_KEYS = ["daemon.port", "daemon.host", "daemon.db_conflict", "db.path"];
 const BOOT_ONLY_PREFIXES = ["transcripts.enabled", "transcripts.path"];
 
 function isBootOnlyKey(key: string): boolean {
@@ -70,7 +70,7 @@ Keys:
   context.root           addressable context library for 'rig context add' (default $OPENRIG_HOME/context)
   context.system_world   default System World, replacement manifest path, or disabled
   skills.root            versioned skill catalog (default $OPENRIG_HOME/skills)
-  skills.router_line.enabled  the person's yes to the one-line seat-skills bootstrap in AGENTS.md / CLAUDE.md (default false)
+  skills.router_line.enabled  the person's yes to the seat-skills line (one line plus OpenRig's markers) in AGENTS.md / CLAUDE.md (default false)
   onboarding.default_pack.enabled  deliver the two-part fresh-seat mental-model pack (default on)
   health.context_pressure.*        context-pressure warning/critical percentages (defaults 95/99)
   files.allowlist        name:/abs/path,name:/abs/path
@@ -114,10 +114,15 @@ Keys:
   output.whoami_peers    with output.compact on, how many peers rig whoami --json lists, edge peers first; --all-peers lists all (default 8)
   bundle.services_enabled Service-backed bundle packing, preview and target installs (default off)
   provider.usage_windows Codex and Claude usage windows in rig provider status (Codex read on request; Claude from its seats' status lines) (default off)
+  provider.selected      the providers chosen at rig setup --providers (claude, codex or claude,codex); kernel boot uses only these (default empty: every signed-in provider)
   usage.pi_cost_facts    Pi seats report model-priced cost from their persisted session entries to rig usage cost (default off)
   usage.pi_openrouter_charge  with usage.pi_cost_facts on, Pi seats look up OpenRouter's actual charge for their requests, shown beside the estimate (default off; changes take effect when a Pi seat next launches or resumes; earlier outcomes stay visible)
   transport.verify_input_box  with --verify, a send to a Claude Code or Codex seat (also queue wakes) reads verified only when the seat was proven idle before the paste and its input box showed the exact text before Enter and was empty after it, on the same pane process; a busy or unknown seat, and anything else, reads unconfirmed, not failed. Reporting only (default off)
   transport.local_user_guard  on a Mac, the CLI refuses a local daemon whose reported user, checked with ps, isn't yours; an explicit OPENRIG_URL skips the check. A mitigation for reaching the wrong daemon, not authentication (default off)
+  decisions.enabled      typed decisions (OpenRouter + Jev) for the consumers in decisions.consumers, with OPENROUTER_API_KEY from the
+                         rig process that runs them; off makes no provider calls (default off). rig project decisions status shows the state
+  decisions.consumers    comma-separated consumers that may call (supported: stream; default none). An unknown name makes no calls
+  decisions.template_dir absolute folder of <name>.yaml templates that replace the shipped ones (default empty: shipped templates only)
 
 Precedence: CLI flag > environment variable > config file > default`)
     .action((opts: { json?: boolean; withSource?: boolean }) => {

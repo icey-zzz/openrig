@@ -76,6 +76,13 @@ content, and capture resolving a seat by member-name prefix). The read-only inst
 can't carry them, so they stay per-PR evidence outside CI. A green run here shows the
 passing leg only.
 
+The existing `daemon-restart` case also connects the installed `rig mcp serve` over
+stdio, using its shipped SDK. It checks whoami with a configured stub seat and with
+none, queue create/show attribution, the missing-item daemon code in structured
+content, and the four server instruction lines. The captured MCP results and direct
+daemon error readback are in the case report. Both MCP children close before teardown;
+this adds no container, YAML verb, provider client or model call.
+
 The other library scenarios are **unadmitted**. Several need step-time `emit`,
 `policy`, `mutate`, or `restore`. Others have incomplete assertions or setup:
 clean-lifecycle has no post-down residue assertion, ps-scope neither brings up its
@@ -104,9 +111,11 @@ DOCKER_HOST=ssh://your-test-executor bash scripts/run-pr-scenarios.sh \
 Leave `DOCKER_CONTEXT` unset when selecting `DOCKER_HOST`, so a saved context cannot
 override the explicitly selected executor. This does not change Docker configuration.
 Use a fresh output directory for each retained run. Without `--mode` the selected
-case runs healthy / lost-baton / healthy. Without `--case` both cases run. CI keeps
-its existing six-run default. A single healthy run establishes only that leg; it is
-not the paired seeded-regression proof.
+seeded case runs healthy / lost-baton / healthy. Without `--case` all eight cases run,
+fourteen container runs by default: the `fixture` and `library` seeded pairs (healthy /
+lost-baton / healthy each), the `refocus-parked` seeded pair (healthy / seeded /
+healthy), and the five passing-only cases (healthy once each). A single healthy run
+establishes only that leg; it is not the paired seeded-regression proof.
 
 The client can be macOS/arm64 while Docker is Linux/amd64: the build reads the
 **server** OS/architecture and passes the same platform to the image builds and
@@ -137,3 +146,24 @@ images or other agents' containers.
 These are controlled hook invocations against the actual scenario daemon, not native Claude/Codex hook scheduling or agent consumption. Fixtures and fault launchers stay under the scenario scaffold; installed hooks are unchanged. The pre-existing queue-durability and passing-only cases are retained.
 
 Managed-compaction coverage uses `managed-compaction-effect.test.ts` in ordinary daemon CI instead: the shipped compact route deliberately refuses `runtime:stub`, and the precompact seam exposes a keyed marker rather than a daemon stream event. The bounded helper fallback drives the real enforcer's command through a stub input model (recorded Claude2.1.282 success792/paste850-851) into the real precompact hook. Healthy and851-character seeded controls assert marker presence/absence, rather than a submit receipt or pane token. This is not native compaction or an installed `rig compact` journey. No runtime filter or ordinary-send behavior changes.
+
+The `daemon-restart` case exercises team-only recovery without the inherited
+`TMUX`/`TMUX_TMPDIR` or the scaffold's forced-socket wrapper. It requires recorded
+process evidence before the first blind restart; then it waits for the actual
+normal poll to persist fresh `tmux_unavailable` verdicts with null current PID
+fields, and performs a second blind restart. Original sessions, running status,
+bindings and private panes/PIDs must survive both restarts without default-socket
+duplicates or supersession. It then restarts with the correct environment and
+sends a unique marker, captured in the addressed seat's pane (rendered delivery,
+not agent consumption).
+
+Immediately before the existing `down` action, a gone-process control rechecks
+one private pane's identity, closes only that fixture pane, independently proves
+its shell, children and recorded seat PIDs gone, and blindly restarts again.
+The dead seat must detach or restore
+with a different live process, while the untouched peer remains unchanged. A
+correct-environment restart then permits the ordinary cleanup. Each partial DB,
+pane and poll observation, and any failed stage, remains in the report; an
+unreadable socket is never an empty census. **Kernel duplication and native
+runtime behavior are not exercised.** The same helper is applied to the release
+cut and the published comparator archive, preserving each one's actual outcome.

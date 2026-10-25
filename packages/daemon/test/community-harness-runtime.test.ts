@@ -41,17 +41,25 @@ function presets(files: Record<string, string>): string {
 }
 const GOOD = "format: 1\nname: synth\ncommand: synth-harness --serve\nmaintainer: Example Maintainer\nlimits: [resume unsupported]\n";
 
+it("loads a maintainer's declaration that startup needs assistance, and rejects a mistyped declaration", () => {
+  const dir = presets({ "synth.yaml": GOOD + "startup_assisted: true\n" });
+  expect(loadCommunityHarnessPreset("synth", dir)).toMatchObject({ ok: true, preset: { startupAssisted: true } });
+  writeFileSync(join(dir, "synth.yaml"), GOOD + "startup_assisted: sometimes\n");
+  expect(loadCommunityHarnessPreset("synth", dir)).toMatchObject({ ok: false,
+    message: expect.stringContaining("startup_assisted must be true or false") });
+});
+
 describe("community harness presets", () => {
   it("loads a preset with the fields this format reads", () => {
     const dir = presets({ "synth.yaml": GOOD });
     expect(loadCommunityHarnessPreset("synth", dir)).toEqual({ ok: true, preset: {
-      name: "synth", command: "synth-harness --serve", maintainer: "Example Maintainer", limits: ["resume unsupported"], path: join(dir, "synth.yaml") } });
+      name: "synth", command: "synth-harness --serve", maintainer: "Example Maintainer", limits: ["resume unsupported"], launchResult: false, namesConversation: false, resume: false, startupAssisted: false, path: join(dir, "synth.yaml") } });
   });
 
   it.each([
     ["a missing file", {}, "missing", `no community harness preset named "synth" is installed`],
     ["another format", { "synth.yaml": GOOD.replace("format: 1", "format: 2") }, "incompatible", "it declares format 2; this OpenRig reads format 1"],
-    ["a field this format doesn't read", { "synth.yaml": `${GOOD}resume: --resume {token}\n` }, "incompatible", "unknown field resume"],
+    ["a field this format doesn't read", { "synth.yaml": `${GOOD}session: --resume {token}\n` }, "incompatible", "unknown field session"],
     ["a name that isn't the file's", { "synth.yaml": GOOD.replace("name: synth", "name: other") }, "incompatible", `its name is "other", not "synth"`],
     ["no command", { "synth.yaml": GOOD.replace("command: synth-harness --serve\n", "") }, "incompatible", "command must be a non-empty string"],
     ["YAML that doesn't parse", { "synth.yaml": "format: [1" }, "incompatible", "it isn't valid YAML"],

@@ -14,7 +14,7 @@ import type { ContextUsageStore } from "./context-usage-store.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
-import { deriveDisplayActivity } from "./activity-taxonomy.js";
+import { deriveDisplayActivity, type ArbitratedSeatState, type EvidenceRungId } from "./activity-taxonomy.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { probeSessionActivity, mapPaneState } from "./session-transport.js";
 import { DEFAULT_STRUCTURAL_STALE_MS, type StructuralObservation } from "./seat-structural-activity-service.js";
@@ -67,6 +67,7 @@ interface InventoryRow {
   startup_status: string | null;
   resume_type: string | null;
   resume_token: string | null;
+  resume_provenance?: string | null;
   startup_completed_at: string | null;
   binding_attachment_type: string | null;
   binding_id: string | null;
@@ -636,6 +637,7 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       s.startup_status,
       s.resume_type,
       s.resume_token,
+      s.resume_provenance,
       s.startup_completed_at,
       b.attachment_type as binding_attachment_type,
       b.id as binding_id,
@@ -745,7 +747,7 @@ function buildInventoryEntry(
     attachmentType: (row.binding_attachment_type as NodeInventoryEntry["attachmentType"]) ?? null,
     nodeKind: deriveNodeKind(row.runtime),
     runtime: row.runtime,
-    ...(communityHarnessOf(row.session_community_harness, row.runtime) ? { communityHarness: communityHarnessLabel(row.runtime!) } : {}),
+    ...(communityHarnessOf(row.session_community_harness, row.runtime) ? { communityHarness: communityHarnessLabel(row.runtime!, undefined, { resumeType: row.resume_type, resumeToken: row.resume_token, resumeProvenance: row.resume_provenance ?? null }) } : {}),
     sessionStatus,
     storedSessionStatus: row.session_status,
     intentionallyStopped: row.intentionally_stopped === 1
@@ -1149,6 +1151,65 @@ export function getNodeDetailWithContext(
   return detail;
 }
 
+/** The rungs that can answer the needs-input signal (the ones `arbitrate` consults,
+ *  chrome > hooks > self-report). Sampling carries no needs-input evidence. */
+const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lifecycle-hooks", "self-report"];
+
+/**
+ * The shared per-seat and rig-rollup attention predicate. Clients render the
+ * served result rather than repeating this rule. A seat
+ * needs attention iff ANY of:
+ *   - lifecycle `attention_required`
+ *   - startup `attention_required`/`failed` — counted DIRECTLY from
+ *     startupStatus; `latestError` may legitimately be null here
+ *   - `needs_input`: the ARBITRATED seat state is the first answer when it has one
+ *     (`arbitratedNeedsInput` — the same oracle the per-seat row renders, pane chrome
+ *     included), and the served activity's `needs_input` is the fallback when the
+ *     arbitrated signal is `null`: a live hook, else the cached pane reading
+ *     (`hookOrPaneActivity`), which sees a prompt no hook reported. Stale hooks
+ *     arrive as `unknown` and contribute nothing — never guessed. The rig total
+ *     and the seat row must not disagree about the same seat.
+ *   - a held seat (`heldReason` present)
+ *   - a recorded startup error (`latestError` present)
+ */
+export function seatNeedsAttention(
+  entry: NodeInventoryEntry,
+  activity: AgentActivity | null,
+  arbitratedNeedsInput: boolean | null = null,
+): boolean {
+  return entry.lifecycleState === "attention_required"
+    || entry.startupStatus === "attention_required"
+    || entry.startupStatus === "failed"
+    || (arbitratedNeedsInput ?? activity?.state === "needs_input")
+    || entry.heldReason != null
+    || entry.latestError != null;
+}
+
+/**
+ * #180 review — the arbitrated needs-input answer is TRI-STATE; collapsing it to
+ * `needsInput.count > 0` treats `count: 0` as a definite "no" even when no source said
+ * "no". `count: 0` is also the default when no authoritative rung reported needs-input:
+ * a Codex seat (hooks at `trial`), a generic/Pi/OMP seat (sampling floor only), a seat
+ * with no declaration, or a Claude seat whose declared rungs have not reported (after a
+ * daemon restart, or once its hook rung is downgraded). A live `PermissionRequest` in
+ * the hook store must still count there. Rules:
+ *   - count > 0                                    → true  (the service only reports a
+ *     positive count from an authoritative source)
+ *   - count is 0 AND needs-input evidence from an authoritative rung supplied it → false
+ *     (an observed clear legitimately supersedes a stale hook)
+ *   - otherwise                                    → null (let the hook store decide).
+ *     A declared rung is a capability, not an observation that the seat is clear.
+ */
+export function arbitratedNeedsInputSignal(
+  state: Pick<ArbitratedSeatState, "needsInput" | "needsInputEvidence"> | null,
+): boolean | null {
+  if (!state) return null;
+  if (state.needsInput.count > 0) return true;
+  const observedClear = state.needsInputEvidence != null
+    && NEEDS_INPUT_RUNGS.includes(state.needsInputEvidence.rung);
+  return observedClear ? false : null;
+}
+
 /**
  * Slice 15 — populate `terminalActive` + `hasAssignedWork` per node.
  *
@@ -1164,10 +1225,11 @@ export function getNodeDetailWithContext(
  */
 export function attachTerminalActivityAndWork(
   entries: NodeInventoryEntry[],
-  deps: { db: Database.Database; seatActivity?: SeatActivityService },
+  deps: { db: Database.Database; seatActivity?: SeatActivityService; agentActivity?: AgentActivityStore; now?: Date },
 ): NodeInventoryEntry[] {
   const seatActivity = deps.seatActivity ?? null;
   const assignedByDest = readAssignedWorkBySession(deps.db);
+  const now = deps.now ?? new Date();
   return entries.map((entry) => {
     const sessionMissing = identityVerdictConfirmsSessionMissing(entry.identityVerdict);
     let terminalActive: boolean | null | undefined = sessionMissing ? false : undefined;
@@ -1186,8 +1248,9 @@ export function attachTerminalActivityAndWork(
     let activityState: NodeInventoryEntry["activityState"] = sessionMissing ? null : undefined;
     // Capability-checked: a partial injected double without the S19 surface keeps the
     // pre-taxonomy shape (undefined) rather than faking a null oracle answer.
+    const arb = seatActivity && entry.canonicalSessionName && typeof seatActivity.getSeatStateBySession === "function"
+      ? seatActivity.getSeatStateBySession(entry.canonicalSessionName) : null;
     if (!sessionMissing && seatActivity && entry.canonicalSessionName && typeof seatActivity.getSeatStateBySession === "function") {
-      const arb = seatActivity.getSeatStateBySession(entry.canonicalSessionName);
       activityState = arb
         ? {
             activity: arb.activity,
@@ -1200,11 +1263,19 @@ export function attachTerminalActivityAndWork(
         : null;
     }
     const work = countAssignedWorkForEntry(entry, assignedByDest);
+    const arbitratedNeedsInput = arbitratedNeedsInputSignal(arb);
+    const hook = entry.canonicalSessionName
+      ? deps.agentActivity?.getLatestForNode({ sessionName: entry.canonicalSessionName, now }) ?? null : null;
     return {
       ...entry,
       terminalActive,
       lastActivityAt,
       activityState,
+      // The activity this row serves (a live hook, else the cached pane reading) when it was attached, so a prompt
+      // only the pane shows counts; the hook store alone where it wasn't.
+      needsAttention: seatNeedsAttention(entry, entry.agentActivity ?? hook, arbitratedNeedsInput),
+      arbitratedNeedsInput,
+      needsInputEvidence: arb?.needsInputEvidence ?? null,
       hasAssignedWork: work.assignedWorkCount > 0,
       ...work,
     };
@@ -1316,6 +1387,59 @@ export function readAssignedWorkBySession(db: Database.Database): Map<string, As
     });
   }
   return out;
+}
+
+/**
+ * The capture-free answer from a seat's newest hook and its cached pane reading, before motion is applied, or `null`
+ * when neither answers. The per-seat activity below and the rig attention count both read it, so a prompt that only
+ * the pane shows counts in both.
+ */
+export function hookOrPaneActivity(
+  hookActivity: AgentActivity | null | undefined,
+  structural: StructuralObservation | null,
+  /** A positive idle hook gives way to a current complete idle frame (D2). */
+  idleYieldsToFrame = false,
+): { source: "hook" | "limit" | "pane"; activity: AgentActivity } | null {
+  // Running/needs_input hooks keep their meaning.
+  if (hookActivity && hookActivity.state !== "unknown" && !(hookActivity.state === "idle" && idleYieldsToFrame)) {
+    return { source: "hook", activity: hookActivity };
+  }
+
+  // #763: a typed provider-interruption row (at_limit) is positive evidence
+  // even though its state is unknown by construction (it must never count
+  // as waiting-on-a-person). Deliver it instead of the cached pane reading
+  // so a limited seat shows the limit, not idle — but only while current.
+  // Terminal redraws are not recovery evidence and must not erase the limit.
+  // Only a strictly newer, current attention observation outranks it.
+  // A demoted row (aged out or generation-mismatched) falls through to the
+  // structural reading like any other stale hook.
+  if (hookActivity?.rawEvent === "at_limit" && hookActivity.stale !== true && !(
+    structural?.state === "attention" &&
+    Date.parse(structural.observedAt) > Date.parse(hookActivity.eventAt ?? "")
+  )) {
+    return { source: "limit", activity: hookActivity };
+  }
+
+  // Hook ABSENT or unknown/stale → consult the CACHED structural observation. This read is
+  // capture-FREE: the pane capture already happened on the background SeatStructuralActivityService
+  // tick, never here (the healthz-wedge no-per-request-capture invariant is preserved). A structural
+  // motion verdict is a LIVENESS signal that OVERRIDES an absent/stale hook (constraint 2 — liveness
+  // beats hook-arrival age) and makes ACTIVITY real on the DEFAULT path for hook-less / Codex /
+  // just-finished-a-turn seats: the exact fleet-blindness this fix targets. Structural discrimination
+  // is STRUCTURAL (spinner shapes / esc-to-interrupt / idle prompt), never a verb allowlist.
+  if (structural && structural.state !== "unknown") {
+    return {
+      source: "pane",
+      activity: {
+        state: mapPaneState(structural.state),
+        reason: structural.reason,
+        evidenceSource: "pane_heuristic",
+        sampledAt: structural.observedAt,
+        evidence: structural.evidence,
+      },
+    };
+  }
+  return null;
 }
 
 export async function attachAgentActivity(
@@ -1473,53 +1597,12 @@ export async function attachAgentActivity(
       && (!motionRunning || (Number.isFinite(motionMs)
         && Math.floor(capturedMs / 1000) > Math.floor(motionMs / 1000)));
 
-    // Running/needs_input hooks keep their meaning. An idle hook alone still yields to motion
-    // (D2); when a current complete idle frame exists, report that frame's provenance instead.
-    if (hookActivity && hookActivity.state !== "unknown"
-      && !(hookActivity.state === "idle" && motionRunning && currentIdleFrame)) {
-      return {
-        ...entry,
-        agentActivity: withMotion(hookActivity),
-      };
-    }
-
-    // #763: a typed provider-interruption row (at_limit) is positive evidence
-    // even though its state is unknown by construction (it must never count
-    // as waiting-on-a-person). Deliver it instead of the cached pane reading
-    // so a limited seat shows the limit, not idle — but only while current.
-    // Terminal redraws are not recovery evidence and must not erase the limit.
-    // Only a strictly newer, current attention observation outranks it.
-    // A demoted row (aged out or generation-mismatched) falls through to the
-    // structural reading like any other stale hook.
-    if (hookActivity?.rawEvent === "at_limit" && hookActivity.stale !== true && !(
-      structural?.state === "attention" &&
-      Date.parse(structural.observedAt) > Date.parse(hookActivity.eventAt ?? "")
-    )) {
-      return {
-        ...entry,
-        agentActivity: hookActivity,
-      };
-    }
-
-    // Hook ABSENT or unknown/stale → consult the CACHED structural observation. This read is
-    // capture-FREE: the pane capture already happened on the background SeatStructuralActivityService
-    // tick, never here (the healthz-wedge no-per-request-capture invariant is preserved). A structural
-    // motion verdict is a LIVENESS signal that OVERRIDES an absent/stale hook (constraint 2 — liveness
-    // beats hook-arrival age) and makes ACTIVITY real on the DEFAULT path for hook-less / Codex /
-    // just-finished-a-turn seats: the exact fleet-blindness this fix targets. Structural discrimination
-    // is STRUCTURAL (spinner shapes / esc-to-interrupt / idle prompt), never a verb allowlist.
-    if (structural && structural.state !== "unknown") {
-      return {
-        ...entry,
-        agentActivity: withMotion({
-          state: mapPaneState(structural.state),
-          reason: structural.reason,
-          evidenceSource: "pane_heuristic",
-          sampledAt: structural.observedAt,
-          evidence: structural.evidence,
-        }, currentIdleFrame),
-      };
-    }
+    // An idle hook alone still yields to motion (D2); when a current complete idle frame exists, report
+    // that frame's provenance instead.
+    const resolved = hookOrPaneActivity(hookActivity, structural, motionRunning && currentIdleFrame);
+    if (resolved?.source === "hook") return { ...entry, agentActivity: withMotion(resolved.activity) };
+    if (resolved?.source === "limit") return { ...entry, agentActivity: resolved.activity };
+    if (resolved?.source === "pane") return { ...entry, agentActivity: withMotion(resolved.activity, currentIdleFrame) };
 
     // No positive hook and no structural verdict. A stale/unknown hook, if one exists, is delivered
     // HONESTLY as-is (unknown/stale) — never upgraded to a quiet-seat verdict on arrival age alone.

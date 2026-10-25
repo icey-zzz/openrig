@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { AttentionRead, AttentionItem } from "../attention-surface.js";
 import type { QueueRepository } from "../domain/queue-repository.js";
 import { isHumanSeatSessionRef } from "../domain/session-name.js";
+import { unansweredQuestions } from "../domain/human-questions.js";
 import type { HealthProjectionService } from "../domain/health-detectors.js";
 import type { OperatingPostureService } from "../domain/rig-mode/operating-posture.js";
 import { listProjects, insideProject, projectMission, type ProjectRead } from "../domain/workspace/project-read.js";
@@ -32,7 +33,17 @@ export function attentionRoutes(): Hono {
       if (!queue) throw new Error("Queue repository unavailable");
       const rows = queue.listAttention({ limit: 1001 });
       result.sources.push({ source: "queue", state: rows.length >= 1001 ? "partial" : "available", detail: rows.length >= 1001 ? "Attention query reached 1001 rows; showing at most 1000." : "Open human-addressed requests and explicit human blockers; a human-gate tier alone is insufficient." });
-      const current = rows.slice(0, 1000).filter(q => isHumanSeatSessionRef(q.destinationSession) || q.state === "blocked" && isHumanSeatSessionRef(q.blockedOn ?? ""));
+      // An ask to a person counts by its classification, the membership every attention reader shares (a registered person
+      // may be addressed as a seat or an alias), whatever happened to its Slack post.
+      const asked = new Set(rows.slice(0, 1000).filter(q => queue.isCurrentHumanAsk(q.qitemId)).map(q => q.qitemId));
+      const quiet = new Set(rows.slice(0, 1000).filter(q => asked.has(q.qitemId) && queue.humanAskWithoutAlert(q.qitemId)).map(q => q.qitemId));
+      const current = rows.slice(0, 1000).filter(q => isHumanSeatSessionRef(q.destinationSession) || asked.has(q.qitemId) || q.state === "blocked" && isHumanSeatSessionRef(q.blockedOn ?? ""));
+      // Whether the request went to Slack: its own receipt first, then whether it was ever to be sent.
+      const slackLine = (qitemId: string): string => {
+        const delivery = queue.deliveryOutcomeFor(qitemId);
+        if (delivery) return delivery.outcome === "posted" ? "posted (posted isn't read)" : `${delivery.outcome}: ${delivery.detail}`;
+        return quiet.has(qitemId) ? "not sent: created without --alert, and this person's Slack subscription is urgent-only" : "no receipt yet";
+      };
       // Keep an opened request inspectable after its source is resolved, without
       // retaining it in the current Action required feed or inventing an inbox.
       const opened = wanted?.startsWith("queue:") ? queue.getById(wanted.slice(6)) : null;
@@ -42,10 +53,25 @@ export function attentionRoutes(): Hono {
         const p = tags.length === 1 ? projects.find(p => p.id === tags[0] && !p.error) : undefined;
         const deps = queue.db.prepare("SELECT summary, qitem_id FROM queue_items WHERE blocked_on = ? AND state IN ('pending','in-progress','blocked') ORDER BY ts_created DESC LIMIT 101").all(q.qitemId) as Array<{ summary: string | null; qitem_id: string }>;
         const unblocks = isHumanSeatSessionRef(q.blockedOn ?? "") ? q.summary || "The blocked task (inspect the request)" : deps.length ? deps.slice(0, 100).map(d => d.summary || "An unnamed dependent task").join("; ") + (deps.length > 100 ? "; more dependents omitted" : "") : "No dependent task recorded; inspect the request for its intended outcome.";
-        const item: AttentionItem = { id: `queue:${q.qitemId}`, kind: "action", recipient: isHumanSeatSessionRef(q.destinationSession) ? q.destinationSession : q.blockedOn, summary: q.summary || q.body.trim().split(/\r?\n/).find(Boolean) || "Request summary unavailable", urgency: q.priority, unblocks, at: q.tsUpdated, scope: p ? `project ${p.id}` : "instance · project unknown", project: p ? { id: p.id, root: p.root } : null, source: `/api/queue/${encodeURIComponent(q.qitemId)}` };
+        const toPerson = isHumanSeatSessionRef(q.destinationSession) || asked.has(q.qitemId);
+        const questions = q.humanQuestions?.length ? q.humanQuestions : null;
+        const unanswered = questions ? unansweredQuestions(questions, q.humanAnswers ?? {}).length : 0;
+        const item: AttentionItem = { id: `queue:${q.qitemId}`, kind: "action", recipient: toPerson ? q.destinationSession : q.blockedOn,
+          // An ask addressed to the person is answered on this row, as them: Steering's Approve, or, for an ask with questions,
+          // mission control's answer (a choice, their own words, or sending a complete set's recorded answers back), which
+          // Approve would close without returning. They can also open the asker's terminal (Chat). A row parked on them is
+          // resolved another way, so it carries neither.
+          ...(toPerson && q.state === "pending" ? { answer: { verb: questions ? "answer" as const : "approve" as const, actorSession: q.destinationSession } } : {}),
+          ...(toPerson ? { asker: q.sourceSession } : {}),
+          ...(questions ? { humanQuestions: questions, humanAnswers: q.humanAnswers ?? {} } : {}),
+          summary: q.summary || q.body.trim().split(/\r?\n/).find(Boolean) || "Request summary unavailable", urgency: q.priority, unblocks, at: q.tsUpdated, scope: p ? `project ${p.id}` : "instance · project unknown", project: p ? { id: p.id, root: p.root } : null, source: `/api/queue/${encodeURIComponent(q.qitemId)}` };
+        const route = unanswered
+          ? `Decision route: answer its questions here, choosing an option or typing a reply${quiet.has(q.qitemId) ? "; it wasn't sent to Slack" : ", or in the correlated Slack message"}.`
+          : questions && q.state === "pending" ? "Decision route: its questions are all answered, but the answers haven't gone back to the asker yet: send them from here."
+          : quiet.has(q.qitemId) ? "Decision route: answer on Steering; it wasn't sent to Slack." : "Decision route: follow the correlated human request in Slack.";
         add(item, () => {
           const mode = posture?.resolve({ qitemId: q.qitemId });
-          return ["Request:", q.body, ...(q.humanDetail ? ["Supplemental detail:", q.humanDetail] : []), `State: ${q.state}`, `To: ${q.destinationSession}`, `From: ${q.sourceSession}`, `Blocked on: ${q.blockedOn ?? "none"}`, `Posture: ${mode?.posture ?? "unknown"} · ${mode?.reason ?? "posture source unavailable"}`, `Evidence reference: ${q.evidenceRef ?? "none recorded"}`, `Decision route: follow the correlated human request in Slack. Inspect: rig queue show ${q.qitemId} --full`, "Queue history (read/delivery is not approval):", ...queue.listTransitions(q.qitemId).map(t => JSON.stringify(t))];
+          return ["Request:", q.body, ...(q.humanDetail ? ["Supplemental detail:", q.humanDetail] : []), `State: ${q.state}`, `To: ${q.destinationSession}`, `From: ${q.sourceSession}`, `Blocked on: ${q.blockedOn ?? "none"}`, `Posture: ${mode?.posture ?? "unknown"} · ${mode?.reason ?? "posture source unavailable"}`, `Evidence reference: ${q.evidenceRef ?? "none recorded"}`, `Slack: ${slackLine(q.qitemId)}`, `${route} Inspect: rig queue show ${q.qitemId} --full`, "Queue history (read/delivery is not approval):", ...queue.listTransitions(q.qitemId).map(t => JSON.stringify(t))];
         }, () => {
           if (!q.evidenceRef || !path.isAbsolute(q.evidenceRef) && (!p || /^[a-z][a-z\d+.-]*:/i.test(q.evidenceRef))) return [];
           const hash = q.evidenceRef.indexOf("#"), anchor = hash < 0 ? "" : q.evidenceRef.slice(hash);

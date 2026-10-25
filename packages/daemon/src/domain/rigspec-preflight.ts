@@ -139,7 +139,10 @@ export class RigSpecPreflight {
 import { RigSpecCodec } from "./rigspec-codec.js";
 import { RigSpecSchema } from "./rigspec-schema.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveNodeConfig, type ResolutionContext } from "./profile-resolver.js";
+import type { ResolutionContext, ResolutionResult } from "./profile-resolver.js";
+import { withNodeConfigResolver } from "./profile-resolution-worker.js";
+import { releaseScanCache } from "./skill-discovery.js";
+import { randomUUID } from "node:crypto";
 import { getOpenRigInstallCwdError, resolveAuthoredCwd, resolveLaunchCwd } from "./cwd-resolution.js";
 import nodePath from "node:path";
 import { loadCommunityHarnessPreset } from "./community-harness-presets.js";
@@ -290,6 +293,20 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
  * with no YAML round-trip; rigPreflight(yaml) is the parse/normalize front over it.
  */
 export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext): Promise<PreflightResult> {
+  // Members share raw skill scans of identical inputs within this preflight only (#1653). The worker's copy ends
+  // with the worker; the release covers the in-process fallback.
+  const scanScope = randomUUID();
+  try {
+    return await withNodeConfigResolver(resolve => preflightMembers(rigSpec, preflightCtx, context => resolve({ ...context, scanScope })));
+  } finally {
+    releaseScanCache(scanScope);
+  }
+}
+
+async function preflightMembers(
+  rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext,
+  resolveNodeConfigAsync: (context: ResolutionContext) => Promise<ResolutionResult>,
+): Promise<PreflightResult> {
   const errors: string[] = [];
   // §6 reconciliation (PM ruling 2026-08-05): seed EMPTY so main's already-folded activity-hook /
   // collision warnings (pushed below during the checks) come FIRST; the incoming permission-policy
@@ -365,7 +382,7 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         pod,
         rig: rigSpec,
       };
-      const configResult = resolveNodeConfig(ctx);
+      const configResult = await resolveNodeConfigAsync(ctx);
       if (!configResult.ok) {
         for (const err of configResult.errors) {
           errors.push(`${pod.id}.${member.id}: ${err}`);

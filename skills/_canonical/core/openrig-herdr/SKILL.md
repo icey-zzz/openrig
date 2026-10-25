@@ -27,10 +27,13 @@ plugin it.
 ## The whole surface — three verbs
 
 ```bash
-rig terminal open <view> [--provider herdr|cmux] [--json]   # herdr is the default provider
-rig terminal views [--json]                                 # list openable views (saved + derived)
-rig terminal status [--provider] [--json]                   # provider liveness / health
+rig terminal open <view> [--provider herdr|cmux|rex] [--json]   # herdr is the default provider
+rig terminal views [--json]                                     # list openable views (saved + derived)
+rig terminal status [--provider] [--json]                       # provider liveness / health
 ```
+
+Inside Rex, `rig terminal open <view> --window` opens the view as a new Rex session instead, on the same Rex
+server as your terminal, and asks the Rex app to show it. `--provider rex` opens it there from anywhere.
 
 `<view>` resolves, in order, to one of:
 - a **rig name** — every live agent in that rig, auto-laid-out;
@@ -111,6 +114,9 @@ system-clipboard copy works immediately (it's server-wide).
 - **Inner tmux status bar** is hidden by default (herdr provides the chrome); one config key
   (`terminal.status_bar`) flips it back on for raw-tmux / no-provider surfaces, and the flip applies
   to **future launches only**.
+- **After a Herdr server restart or update** (without `--handoff`), Herdr restores the layout and
+  labels but not the processes, so OpenRig's tiles come back as empty shells while the seats keep
+  running. Reopen the view: `rig terminal open <view> --provider herdr`.
 
 ## Saved views — the library (`terminal-views.yaml`)
 

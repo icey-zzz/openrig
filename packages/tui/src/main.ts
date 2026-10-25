@@ -33,6 +33,7 @@ import { restoreKeyAction, type RestoreInputEvent } from "./crash-cart/restore-i
 import { evaluateOneClickGate, restoreConfirmMessage } from "./crash-cart/one-click-gate.js";
 import { daemonStartArgs } from "./crash-cart/start-daemon.js";
 import { readLocal } from "./local-reading.js";
+import { replyAct } from "./attention/attention-model.js";
 import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -439,6 +440,13 @@ async function run(): Promise<void> {
       } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
+      } else if (action.act === "answer") {
+        const { act: _act, type: _type, ...input } = action;
+        const result = await client.missionControlAction(input);
+        view.dispatch({ type: "notice", message: action.verb === "approve"
+          ? `Approved ${action.qitemId} as ${action.actorSession}: the request is closed on its own row.`
+          : result.answer?.message ?? (result.answer?.outcome === "recorded" ? `Recorded on ${action.qitemId}. Still to answer: ${result.answer.unanswered.join("; ")}`
+          : `Answered ${action.qitemId} as ${action.actorSession}: the answer went back to the asker, and the request is closed.`) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -476,6 +484,10 @@ async function run(): Promise<void> {
           notice: message => view.dispatch({ type: "notice", message }), draw,
         }).catch(error => view.dispatch({ type: "notice", message: String(error) }));
       } catch (err) { view.dispatch({ type: "notice", message: (err as Error).message }); }
+      return;
+    }
+    if (action.type === "attention-reply") {
+      perform(replyAct(snapshot.attentionRead, view.get().attentionOpen, action.text));
       return;
     }
     if (action.type === "act") {
@@ -761,8 +773,9 @@ async function run(): Promise<void> {
   draw();
   // Probe the daemon-down verdict once on launch: bare `rig` with the daemon down renders the cockpit.
   // (Key-triggered re-probe after `s start daemon` / `r retry` is the follow-on increment.)
+  // --demo renders its labeled fixture without a daemon, so it never probes for one.
   if (startup) void startup.refresh();
-  else void refreshCrashCart();
+  else if (!demo) void refreshCrashCart();
   // A merely-open TUI must impose no steady-state fleet load. The initial
   // hydrate establishes honest state; navigation, commands, and socket-driven
   // mutations request later truth through the same single-flight owner.
