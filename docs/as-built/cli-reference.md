@@ -188,7 +188,7 @@ the sections that were not read are `null`.
 |---|---|---|
 | `rig gateway` | — | — |
 | `rig gateway human` | — | — |
-| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required** (repeatable)<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required** (repeatable)<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>`<br>`--organization <id>`<br>`--group <id>` (repeatable)<br>`--policy <text>`<br>`--policy-file <path>`<br>`--default` |
 | `rig gateway human list` | — | `--json` |
 | `rig gateway human quiet` | — | — |
 | `rig gateway human quiet set <entityId>` | — | `--daily <window>`<br>`--until <time>`<br>`--tz <zone>`<br>`--actor <actor>`<br>`--json` |
@@ -208,7 +208,23 @@ the sections that were not read are `null`.
 | `rig gateway human show <entityId>` | — | `--json` |
 | `rig gateway human set <entityId> <field> <value>` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig gateway human remove <entityId>` | — | `--force` |
+| `rig gateway channel` | — | — |
+| `rig gateway channel add <id>` | — | `--display-name <name>` **required**<br>`--binding <slack:connectorRef:secretsRef:channelId>` **required**<br>`--organization <id>`<br>`--group <id>` (repeatable)<br>`--policy <text>`<br>`--policy-file <path>`<br>`--replace` |
+| `rig gateway channel remove <id>` | — | `--force` |
+| `rig gateway org` | — | — |
+| `rig gateway org set <id>` | — | `--name <name>`<br>`--policy <text>`<br>`--policy-file <path>` |
+| `rig gateway group` | — | — |
+| `rig gateway group set <id>` | — | `--organization <id>`<br>`--name <name>`<br>`--policy <text>`<br>`--policy-file <path>` |
+| `rig gateway participants` | — | `--organization <id>`<br>`--json` |
+| `rig gateway default [entityId]` | — | `--clear` |
 
+- Several people may be registered. Organizations, groups, readable policy, shared channels and the default person are
+  kept in `$OPENRIG_HOME/gateway/participants.yaml`, never in a person's fragment, so an older daemon still loads every
+  person after a rollback. `human set <entityId> organization|groups|policy <value>` writes there (`unset` clears;
+  `@<path>` reads a policy file). `participants --json` carries each participant's `kind`, `address`, `organization`,
+  `groups`, `default` and `policy` (a list of `{ source, text }`, organization first), plus `default`, `organizations`,
+  `groups`, `warnings` and `participantFile`. `default` with no argument prints the current default and its source
+  (`chosen` or `only-person`), or `null` with the reason. See `docs/reference/gateway-participants.md`.
 - `human set <entityId> slack-subscription <value>` — sets the person's Slack subscription: `every-ask` (the default) posts every ask to them to Slack; `urgent-only` posts only asks created with `--alert`, and other asks wait on Steering and the TUI; `unset` removes the authored subscription so the default applies. `human show` prints the value with its origin, `authored` or `default` (`slack-subscription: every-ask (default)`); `--json` carries it as `record.slackSubscription` `{ value, source }`.
 
 ### parked

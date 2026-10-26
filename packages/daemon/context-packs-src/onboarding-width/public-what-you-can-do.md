@@ -198,9 +198,10 @@ unseen — which makes messages the one delivery channel that never gets skipped
   `env -u TMUX <tmuxAttachCommand>`. Inspect the result and visible content, or
   say what cannot be verified. On a desktop, do not finish by printing a command for the person to
   type. Only if the window cannot open, `rig tui --shared` is the dashboard-only fallback; explain
-  the failure. `--provider herdr` or `--provider cmux` adds tiles inside a workspace that is
-  already visible, without opening a window; in `--json` output, `reusedWorkspace` with no new
-  tiles means an existing view was reused, which is success.
+  the failure. In the window's `--json` output, `reusedWorkspace` with no new tiles means an
+  existing view was reused, which is success. `--provider herdr` or `--provider cmux` opens the
+  view in a provider that is already running, without opening a window; each such open adds a new
+  workspace, so to come back to a view, focus its open space.
   Add `--session <name>` to select a Herdr session for that request; `--session default`
   explicitly selects its default session. `rig terminal status --session <name>` inspects
   the same endpoint. Omitting the flag keeps the daemon's configured endpoint. Herdr tiles come
@@ -1169,9 +1170,10 @@ your circumstances is configuration, and the ones that are not, another agent ca
   behaviour from the web UI. The TUI plus Slack are the human surface; the CLI plus terminal are the agent surface.
 - **`rig mcp serve`** — how an agent that speaks MCP rather than shell drives OpenRig, and which
   operations are exposed that way. Relevant the moment a tool you are integrating cannot run a
-  shell command. Five queue tools (`rig_queue_create`, `rig_queue_show`, `rig_queue_list`,
-  `rig_queue_claim`, `rig_queue_update`) act as the seat named by `OPENRIG_SESSION_NAME`, so an
-  agent with no shell can hand work to the team and read the closing note as its answer. Nothing
+  shell command. Its queue tools (`rig_queue_create`, `rig_queue_show`, `rig_queue_list`,
+  `rig_queue_claim`, `rig_queue_update`, `rig_queue_handoff`, `rig_queue_unclaim`) act as the seat
+  named by `OPENRIG_SESSION_NAME`, so an agent with no shell can hand work to the team, read the
+  closing note as its answer, and pass on or put back work it holds. Nothing
   wakes such an agent; it sees new work when it checks. Its tools cover the whole delegation loop:
   find its seat, team and lead (`rig_whoami`, `rig_team`), hand work on and follow the handoff's
   successor, find finished work and read its artifact, decide inside a person's decision room,

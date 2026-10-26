@@ -273,6 +273,23 @@ export function humansDir(home: string = getOpenRigHome()): string {
 export function projectionPath(home: string = getOpenRigHome()): string {
   return join(home, "gateway", "humans.generated.yaml");
 }
+/** The participant side file (participants.ts owns its contents). Older daemons never read it. */
+export function participantsPath(home: string = getOpenRigHome()): string {
+  return join(home, "gateway", "participants.yaml");
+}
+
+/** People and shared channels share one address space (<id>@external): the shared channel registered under `entityId`,
+ *  if the participant file names one. A file that doesn't parse names none here — it never blocks registering a person,
+ *  and its own error is reported where it's read. */
+function sharedChannelWithId(entityId: string, home: string): string | null {
+  const path = participantsPath(home);
+  if (!existsSync(path)) return null;
+  let raw: unknown;
+  try { raw = parseYaml(readFileSync(path, "utf8")); } catch { return null; }
+  const entry = isObj(raw) && isObj(raw.participants) ? raw.participants[entityId] : undefined;
+  if (!isObj(entry) || entry.kind !== "shared-channel") return null;
+  return typeof entry.displayName === "string" ? entry.displayName : entityId;
+}
 
 /** @deprecated Historical spelling retained for readers of old records only.
  * Never a routing default: an address must resolve to an actual registry entity. */
@@ -384,7 +401,7 @@ export function resolveSlackHandle(
   };
 }
 
-function atomicWrite(path: string, body: string): { ok: true } | { ok: false; error: string } {
+export function atomicWrite(path: string, body: string): { ok: true } | { ok: false; error: string } {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp-${process.pid}`;
@@ -424,6 +441,11 @@ export function addHumanFragment(
   const file = join(humansDir(home), `${v.fragment.entityId}.yaml`);
   if (!opts.replace && existsSync(file)) {
     return { ok: false, error: `human "${v.fragment.entityId}" already exists at ${file} — pass an explicit replace to update it (no silent overwrite)` };
+  }
+  // A person can't take a shared channel's id: they'd share <id>@external, and the participant file would stop reading.
+  const channel = sharedChannelWithId(v.fragment.entityId, home);
+  if (channel !== null) {
+    return { ok: false, error: `"${v.fragment.entityId}" is already the shared channel "${channel}" (${v.fragment.entityId}@${ADDRESS_DOMAIN}); choose another id for the person, or remove the channel first with rig gateway channel remove ${v.fragment.entityId}` };
   }
   // A6 v3 pin-1: reject a handle already claimed by a DIFFERENT human BEFORE writing (never leave a
   // conflicting fragment on disk with a failed re-projection). projectHumans is the load-time backstop.
@@ -487,13 +509,8 @@ export interface HumanSummary {
 }
 
 export type ListHumansResult =
-  | { ok: true; humans: HumanSummary[]; advisory?: string }
+  | { ok: true; humans: HumanSummary[] }
   | { ok: false; error: string };
-
-/** Amendment A1 (founder R5): the human surface is SINGLE-HUMAN. Several fragments render
- *  honestly, but enumeration is display, never management — the advisory names the boundary. */
-export const MULTI_HUMAN_ADVISORY =
-  "several human fragments exist; OpenRig supports one configured human, so they are displayed as found and no command manages several";
 
 /** A field value with its provenance: authored in the fragment, or filled by a default. */
 export interface ProvenancedValue<T> {
@@ -591,7 +608,8 @@ export function listHumans(home: string = getOpenRigHome()): ListHumansResult {
       fragmentPath: fragmentPathFor(e.entityId, home),
     };
   });
-  return humans.length > 1 ? { ok: true, humans, advisory: MULTI_HUMAN_ADVISORY } : { ok: true, humans };
+  // Several people are a supported registry (0.7.3): the default and their placement live in gateway/participants.yaml.
+  return { ok: true, humans };
 }
 
 /** Read one fragment RAW (for authored-vs-default provenance) + validated. */
@@ -849,6 +867,12 @@ export type LoadResult =
   | { ok: true; entities: HumanFragment[] }
   /** `noHumans`: refused because nobody is registered yet (no fragments, nothing projected), not a broken registry. */
   | { ok: false; error: string; noHumans?: true };
+
+/** The people a load names, for paths that don't need a person: none when nobody is registered yet, so a registered
+ *  shared channel still converses in a channel-only setup (0.7.3); null when the registry is broken (fail-closed). */
+export function registeredPeople(loaded: LoadResult): HumanFragment[] | null {
+  return loaded.ok ? loaded.entities : loaded.noHumans ? [] : null;
+}
 
 /** Recognize only projection bytes an adopted generator could have emitted. The
  * parsed snapshot is validation evidence, never identity input; current fragments

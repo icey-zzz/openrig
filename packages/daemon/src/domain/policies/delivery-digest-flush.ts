@@ -16,6 +16,7 @@ import { makeQueuePorts } from "../gateway/slack/queue-access.js";
 import type { OwnerNotificationLevel } from "../queue-transition-log.js";
 import { OUTBOUND_OP } from "../gateway/slack/outbound-driver.js";
 import { DispatchBuffer } from "../gateway/dispatch-buffer.js";
+import { resolveDefaultPerson } from "../gateway/participants.js";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
 import { quietHoldFor } from "../gateway/human-quiet-windows.js";
 import { WatchdogJobsRepository } from "../watchdog-jobs-repository.js";
@@ -43,7 +44,8 @@ export interface RunDeliveryDigestFlushInput {
 export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput): Promise<{ dispatched: number; members: number }> {
   const reg = input.registry.loadHumanRegistry(input.home);
   if (!reg.ok || !reg.entities || reg.entities.length === 0) return { dispatched: 0, members: 0 };
-  const human = reg.entities[0]!;
+  // Asks and updates below go to their own recipients; the digest of notices goes to the default person.
+  const human = resolveDefaultPerson(reg.entities, input.home).person;
 
   const ports = makeQueuePorts(input.queueRepo, {
     loadHumanRegistry: () => reg,
@@ -110,6 +112,8 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
     if (result.ok) completeDispatched++;
   }
   if (!members.length) return { dispatched: completeDispatched, members: selected.length };
+  // Several people and none chosen: the notices wait (they stay selectable) rather than going to whoever sorts first.
+  if (!human) return { dispatched: completeDispatched, members: selected.length };
 
   const memberReceipts = members.map((m) => ({
     qitemId: m.qitemId,

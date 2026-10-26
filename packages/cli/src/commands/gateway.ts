@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { resolveSenderSession, SENDER_FALLBACK } from "../sender-identity.js";
 // The human registry is home-state owned by the daemon; the verb LAZY-imports the narrow
@@ -182,32 +183,30 @@ export function gatewayCommand(deps: GatewayCommandDeps = {}): Command {
     .option("--replace", "Explicitly replace an existing human (no silent overwrite)")
     .option("--reason <reason>", "Reason recorded with connector binding changes", "register human delivery")
     .option("--actor <actor>", "Named operator when outside a managed seat")
-    .action(async (entityId: string, opts: { displayName: string; binding: string[]; deliveryClass: string; away?: boolean; replace?: boolean; reason: string; actor?: string }) => {
+    .option("--organization <id>", "The person's organization (create it first with rig gateway org set)")
+    .option("--group <id>", "A group the person belongs to (repeatable; create it first with rig gateway group set)", (v: string, acc: string[] = []) => { acc.push(v); return acc; })
+    .option("--policy <text>", "Readable policy for agents working with this person (text, not enforced)")
+    .option("--policy-file <path>", "Read the policy text from a file")
+    .option("--default", "Make this person the default: the one escalations, the notice digest and other unaddressed needs go to")
+    .action(async (entityId: string, opts: { displayName: string; binding: string[]; deliveryClass: string; away?: boolean; replace?: boolean; reason: string; actor?: string; organization?: string; group?: string[]; policy?: string; policyFile?: string; default?: boolean }) => {
       // LAZY import the narrow daemon surface at invocation (dep rail 2).
       const registry = await import("@openrig/daemon/gateway-human-registry");
       const { addHumanFragment, parseBindingSpec } = registry as unknown as {
         addHumanFragment: typeof AddHumanFragment;
         parseBindingSpec: (spec: string) => { ok: true; binding: Record<string, unknown> } | { ok: false; error: string };
       };
-      // Fix-r1 F1 (R2 blocking, A1/R5): the add VERB is the single-human boundary. A second
-      // DISTINCT human is refused BEFORE any parse or write — the several-fragment state A1
-      // describes as hand-authored must never be produced by the product's own surface.
-      // Fail closed: an unverifiable registry refuses too (never add into an unknown state).
-      const existing = registry.listHumans();
-      if (!existing.ok) {
-        console.error(`refused: cannot verify the single-human boundary — ${existing.error}`);
-        process.exitCode = 1;
-        return;
-      }
-      if (existing.humans.length > 0 && !existing.humans.some((h) => h.entityId === entityId)) {
-        const ids = existing.humans.map((h) => h.entityId).join(", ");
-        console.error(
-          `refused: a human is already configured (${ids}). OpenRig supports one configured human, so \`rig gateway human add\` manages one; ` +
-          `to register someone else, remove the existing one first (\`rig gateway human remove <entityId>\`). Fragments hand-authored under ${registry.humansDir()} ` +
-          `are displayed as found, with an advisory, but no command manages several.`,
-        );
-        process.exitCode = 1;
-        return;
+      // Several people may be registered. Their organization, groups, policy and the default go in the participant side
+      // file, never the fragment, so an older daemon still loads every person after a rollback.
+      const policy = readPolicyOption(opts);
+      if (!policy.ok) { console.error(`refused: ${policy.error}`); process.exitCode = 1; return; }
+      const placed = opts.organization !== undefined || opts.group !== undefined || policy.value !== undefined;
+      if (placed) {
+        // Check the organization and groups exist before writing anything, so a typo doesn't leave a half-placed person.
+        const side = registry.readParticipantsFile();
+        if (!side.ok) { console.error(`refused: ${side.error}`); process.exitCode = 1; return; }
+        if (opts.organization && !side.file.organizations[opts.organization]) { console.error(`refused: no organization "${opts.organization}" — create it with rig gateway org set ${opts.organization} --name …`); process.exitCode = 1; return; }
+        const unknownGroup = (opts.group ?? []).find((group) => !side.file.groups[group]);
+        if (unknownGroup) { console.error(`refused: no group "${unknownGroup}" — create it with rig gateway group set ${unknownGroup} --organization … --name …`); process.exitCode = 1; return; }
       }
       const bindings: Record<string, unknown>[] = [];
       for (const spec of opts.binding) {
@@ -236,7 +235,19 @@ export function gatewayCommand(deps: GatewayCommandDeps = {}): Command {
             return { value: res, after: { digest }, effect: before.ok && registry.channelStateDigest(before.record.connectorBindings.map(({ inboundResolvable: _derived, ...binding }) => binding)) === digest ? "no-op" : "applied" };
           },
         });
-        console.log(JSON.stringify({ ok: true, entityId, path: result.value.path, receipt: result.receipt }));
+        // The person is registered; their placement and the default are a second, separate write.
+        const followUps: Record<string, unknown> = {};
+        if (placed) {
+          const res = registry.setPersonPlacement(entityId, { organization: opts.organization, groups: opts.group, policy: policy.value });
+          followUps.placement = res.ok ? { path: res.path } : { error: res.error };
+        }
+        if (opts.default) {
+          const res = registry.setDefaultPerson(entityId);
+          followUps.default = res.ok ? { path: res.path } : { error: res.error };
+        }
+        const failed = Object.values(followUps).some((value) => "error" in (value as object));
+        console.log(JSON.stringify({ ok: !failed, entityId, path: result.value.path, receipt: result.receipt, ...followUps }));
+        if (failed) { console.error(`the person was registered, but part of their placement wasn't saved; fix it with rig gateway human set ${entityId} … or rig gateway default ${entityId}`); process.exitCode = 1; }
       } catch (error) { console.error(`refused: ${(error as Error).message}`); process.exitCode = 1; }
     })
     .addHelpText("after", `
@@ -259,7 +270,7 @@ Example:
 
   human
     .command("list")
-    .description("Show the configured human (OpenRig supports one; extra hand-authored fragments are listed with an advisory)")
+    .description("List the registered people, with delivery readiness and quiet hours (rig gateway participants adds organizations, groups, policy and shared channels)")
     .option("--json", "Complete record(s) as JSON")
     .action(async (opts: { json?: boolean }) => {
       const { listHumans } = await import("@openrig/daemon/gateway-human-registry");
@@ -270,7 +281,7 @@ Example:
         return { ...record, deliveryReadiness: await humanReadiness(record.entityId),
           quiet: quiet.ok ? quiet.quiet : { unknown: `quiet hours could not be read from the daemon: ${quiet.reason}` } };
       }));
-      if (opts.json) { console.log(JSON.stringify({ ok: true, humans, ...(res.advisory ? { advisory: res.advisory } : {}) })); return; }
+      if (opts.json) { console.log(JSON.stringify({ ok: true, humans })); return; }
       if (res.humans.length === 0) { console.log("no human configured yet — register one: rig gateway human add <entityId> --display-name … --binding … --delivery-class …"); return; }
       for (const h of humans) {
         const inbound = h.bindings.inboundResolvable ? "" : "  [outbound-only]";
@@ -278,7 +289,6 @@ Example:
         if (!h.deliveryReadiness.ready) console.log(`  delivery: ${h.deliveryReadiness.reason}${h.deliveryReadiness.nextAction ? `; next: ${h.deliveryReadiness.nextAction}` : ""}`);
         console.log(`  ${"unknown" in h.quiet ? `quiet: unknown (${h.quiet.unknown})` : describeQuiet(h.quiet)}`);
       }
-      if (res.advisory) console.log(`advisory: ${res.advisory}`);
     });
 
   const quiet = human.command("quiet").description("Quiet hours: while on, routine asks to this person are held, not posted; urgent ones (tagged escalation) still reach them. Held asks post once, each on its own, when quiet ends");
@@ -520,13 +530,22 @@ Examples:
     .description("Show the effective record: fragment values + which defaults filled the rest, with provenance")
     .option("--json", "Complete record as JSON")
     .action(async (entityId: string, opts: { json?: boolean }) => {
-      const { showHuman } = await import("@openrig/daemon/gateway-human-registry");
+      const { showHuman, participantsView } = await import("@openrig/daemon/gateway-human-registry");
       const res = showHuman(entityId);
       if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
-      const r = { ...res.record, deliveryReadiness: await humanReadiness(entityId) };
+      // The person's organization, groups, policy and whether they're the default come from the participant side file.
+      const view = participantsView();
+      const placement = view.ok ? view.participants.find((p) => p.id === entityId) : undefined;
+      const participant = placement
+        ? { organization: placement.organization, groups: placement.groups, default: placement.default, policy: placement.policy }
+        : { unavailable: view.ok ? "not found" : view.error };
+      const sideFileError = view.ok ? view.sideFile.error : undefined;
+      const r = { ...res.record, participant, ...(sideFileError ? { participantFileError: sideFileError } : {}), deliveryReadiness: await humanReadiness(entityId) };
       if (opts.json) { console.log(JSON.stringify({ ok: true, record: r })); return; }
       console.log(`${r.entityId} (${r.address}) — "${r.displayName}"`);
       console.log(`  fragment: ${r.fragmentPath}`);
+      if (placement) for (const line of describePlacement(placement)) console.log(line);
+      if (sideFileError) console.log(`  participant file: ${sideFileError}`);
       console.log(`  delivery-class: ${r.prefs.deliveryClass.value} (${r.prefs.deliveryClass.source})`);
       console.log(`  away: ${r.prefs.away.value} (${r.prefs.away.source})`);
       console.log(`  slack-subscription: ${r.slackSubscription.value} (${r.slackSubscription.source})`);
@@ -539,11 +558,26 @@ Examples:
 
   human
     .command("set <entityId> <field> <value>")
-    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (the person's Slack subscription: every-ask, the default, posts every ask to Slack too; urgent-only posts only asks created with --alert, the rest wait on Steering and the TUI; or unset), binding.<n>")
+    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (the person's Slack subscription: every-ask, the default, posts every ask to Slack too; urgent-only posts only asks created with --alert, the rest wait on Steering and the TUI; or unset), binding.<n>; and, kept in the participant side file: organization (an id, or unset), groups (comma-separated ids, or unset), policy (text, @<path> to read a file, or unset)")
     .option("--reason <reason>", "Reason recorded with connector binding changes", "update human binding")
     .option("--actor <actor>", "Named operator when outside a managed seat")
     .action(async (entityId: string, field: string, value: string, opts: { reason: string; actor?: string }) => {
       const registry = await import("@openrig/daemon/gateway-human-registry");
+      if (field === "organization" || field === "groups" || field === "policy") {
+        const clear = value === "unset";
+        let input: Record<string, unknown>;
+        if (field === "organization") input = { organization: clear ? null : value };
+        else if (field === "groups") input = { groups: clear ? null : value.split(",").map((g) => g.trim()).filter(Boolean) };
+        else {
+          const policy = clear ? { ok: true as const, value: null } : value.startsWith("@") ? readPolicyOption({ policyFile: value.slice(1) }) : { ok: true as const, value };
+          if (!policy.ok) { console.error(`refused: ${policy.error}`); process.exitCode = 1; return; }
+          input = { policy: policy.value };
+        }
+        const res = registry.setPersonPlacement(entityId, input);
+        if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+        console.log(JSON.stringify({ ok: true, entityId, field, path: res.path }));
+        return;
+      }
       if (field.startsWith("binding.")) {
         const before = registry.showHuman(entityId);
         if (!before.ok) { console.error(`refused: ${before.error}`); process.exitCode = 1; return; }
@@ -600,7 +634,141 @@ Examples:
       ];
       const res = removeHumanFragment(entityId, { force: !!opts.force, inflight });
       if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
-      console.log(JSON.stringify({ ok: true, removed: res.removed, archivedPath: res.archivedPath, ...(res.orphanRecordPath ? { orphanRecordPath: res.orphanRecordPath } : {}) }));
+      // Their placement and, if it was them, the default go too; a later read would ignore them anyway, with a warning.
+      const { removeParticipantEntry } = await import("@openrig/daemon/gateway-human-registry");
+      const side = removeParticipantEntry(entityId, undefined, { kind: "person" });
+      console.log(JSON.stringify({ ok: true, removed: res.removed, archivedPath: res.archivedPath, ...(res.orphanRecordPath ? { orphanRecordPath: res.orphanRecordPath } : {}),
+        participantFile: side.ok ? { path: side.path } : { error: side.error } }));
+    });
+
+  // ── Participants beyond people (0.7.3): shared channels, organizations, groups, readable policy and the default. All of
+  // it lives in gateway/participants.yaml, which older daemons don't read, so a rollback still loads every person.
+
+  const channel = cmd.command("channel").description("Shared-channel participants: one vetted Slack channel is one participant (<id>@external), not a person per sender");
+  channel
+    .command("add <id>")
+    .description("Register a shared channel")
+    .requiredOption("--display-name <name>", "Human-readable name, e.g. \"Acme customers\"")
+    .requiredOption("--binding <slack:connectorRef:secretsRef:channelId>", "The channel: connector kind (slack), connector label, vault pointer for its secrets (never the secret), and the Slack channel id")
+    .option("--organization <id>", "Its organization (create it first with rig gateway org set)")
+    .option("--group <id>", "A group it belongs to (repeatable)", (v: string, acc: string[] = []) => { acc.push(v); return acc; })
+    .option("--policy <text>", "Readable policy for agents answering this channel (text, not enforced)")
+    .option("--policy-file <path>", "Read the policy text from a file")
+    .option("--replace", "Explicitly replace an existing channel (no silent overwrite)")
+    .action(async (id: string, opts: { displayName: string; binding: string; organization?: string; group?: string[]; policy?: string; policyFile?: string; replace?: boolean }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      const policy = readPolicyOption(opts);
+      if (!policy.ok) { console.error(`refused: ${policy.error}`); process.exitCode = 1; return; }
+      const parts = opts.binding.split(":");
+      if (parts.length < 4 || parts[0] !== "slack") { console.error("refused: --binding must be slack:<connectorRef>:<secretsRef>:<channelId>"); process.exitCode = 1; return; }
+      const res = registry.setSharedChannel(id, {
+        displayName: opts.displayName,
+        channel: { connector: "slack", connectorRef: parts[1]!, secretsRef: parts.slice(2, -1).join(":"), channelId: parts[parts.length - 1]! },
+        organization: opts.organization, groups: opts.group, policy: policy.value,
+      }, { replace: !!opts.replace });
+      if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+      console.log(JSON.stringify({ ok: true, id, address: `${id}@${registry.ADDRESS_DOMAIN}`, path: res.path }));
+    });
+  channel
+    .command("remove <id>")
+    .description("Remove a shared channel: refuses while non-terminal rows are addressed to it (--force removes anyway)")
+    .option("--force", "Remove despite KNOWN non-terminal rows")
+    .action(async (id: string, opts: { force?: boolean }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      const side = registry.readParticipantsFile();
+      if (!side.ok) { console.error(`refused: ${side.error}`); process.exitCode = 1; return; }
+      if (side.file.participants[id]?.kind !== "shared-channel") { console.error(`refused: no shared channel "${id}"`); process.exitCode = 1; return; }
+      const address = `${id}@${registry.ADDRESS_DOMAIN}`;
+      const rowsRes = await queueRows(address);
+      if (!rowsRes.ok) { console.error(`refused: the queue could not be checked for rows addressed to ${address} (${rowsRes.error}); --force doesn't override an unchecked board`); process.exitCode = 1; return; }
+      if (rowsRes.rows.length && !opts.force) {
+        console.error(`refused: ${rowsRes.rows.length} non-terminal row(s) are addressed to ${address} (${rowsRes.rows.map((r) => r.id).join(", ")}); pass --force to remove anyway`);
+        process.exitCode = 1;
+        return;
+      }
+      const res = registry.removeParticipantEntry(id, undefined, { kind: "shared-channel" });
+      if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+      console.log(JSON.stringify({ ok: true, removed: id, path: res.path, ...(rowsRes.rows.length ? { orphanedRows: rowsRes.rows.map((r) => r.id) } : {}) }));
+    });
+
+  const org = cmd.command("org").description("Organizations: the outer layer of participants, with readable policy agents apply");
+  org
+    .command("set <id>")
+    .description("Create or update an organization")
+    .option("--name <name>", "Display name (required when new)")
+    .option("--policy <text>", "Readable policy for agents working with this organization (text, not enforced; \"\" clears it)")
+    .option("--policy-file <path>", "Read the policy text from a file")
+    .action(async (id: string, opts: { name?: string; policy?: string; policyFile?: string }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      const policy = readPolicyOption(opts);
+      if (!policy.ok) { console.error(`refused: ${policy.error}`); process.exitCode = 1; return; }
+      const res = registry.setOrganization(id, { name: opts.name, ...(policy.value !== undefined ? { policy: policy.value || null } : {}) });
+      if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+      console.log(JSON.stringify({ ok: true, organization: id, path: res.path }));
+    });
+
+  const group = cmd.command("group").description("Groups inside an organization, with readable policy agents apply");
+  group
+    .command("set <id>")
+    .description("Create or update a group")
+    .option("--organization <id>", "Its organization (required when new)")
+    .option("--name <name>", "Display name (required when new)")
+    .option("--policy <text>", "Readable policy for agents working with this group (text, not enforced; \"\" clears it)")
+    .option("--policy-file <path>", "Read the policy text from a file")
+    .action(async (id: string, opts: { organization?: string; name?: string; policy?: string; policyFile?: string }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      const policy = readPolicyOption(opts);
+      if (!policy.ok) { console.error(`refused: ${policy.error}`); process.exitCode = 1; return; }
+      const res = registry.setGroup(id, { organization: opts.organization, name: opts.name, ...(policy.value !== undefined ? { policy: policy.value || null } : {}) });
+      if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+      console.log(JSON.stringify({ ok: true, group: id, path: res.path }));
+    });
+
+  cmd
+    .command("participants")
+    .description("List people and shared channels, with organization, groups, policy and the default")
+    .option("--organization <id>", "Only this organization's participants")
+    .option("--json", "Complete records as JSON, including organizations and groups")
+    .action(async (opts: { organization?: string; json?: boolean }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      const view = registry.participantsView();
+      if (!view.ok) { console.error(`refused: ${view.error}`); process.exitCode = 1; return; }
+      const shown = opts.organization ? view.participants.filter((p) => p.organization?.id === opts.organization) : view.participants;
+      const defaultPerson = view.default.person ? { id: view.default.person.entityId, source: view.default.source } : { id: null, reason: view.default.source === "none" ? view.default.reason : null };
+      if (opts.json) {
+        const side = registry.readParticipantsFile();
+        console.log(JSON.stringify({ ok: true, participants: shown, default: defaultPerson,
+          organizations: side.ok ? side.file.organizations : null, groups: side.ok ? side.file.groups : null,
+          warnings: view.warnings, participantFile: view.sideFile }));
+        return;
+      }
+      if (!shown.length) console.log(opts.organization ? `no participants in organization "${opts.organization}"` : "no participants yet: rig gateway human add … registers a person, rig gateway channel add … a shared channel");
+      for (const p of shown) {
+        console.log(`${p.id}  ${p.kind}  "${p.displayName}"  ${p.address}${p.channel ? `  channel ${p.channel.channelId}` : ""}`);
+        for (const line of describePlacement(p)) console.log(line);
+      }
+      console.log(defaultPerson.id ? `default: ${defaultPerson.id} (${defaultPerson.source === "chosen" ? "chosen" : "the only person"})` : `default: none — ${defaultPerson.reason}`);
+      for (const warning of view.warnings) console.log(`warning: ${warning}`);
+      if (view.sideFile.error) console.log(`participant file: ${view.sideFile.error}`);
+    });
+
+  cmd
+    .command("default [entityId]")
+    .description("Show or choose the default person: the one escalations, the notice digest, Mission Control's my-queue and pairing go to when no person is named")
+    .option("--clear", "Clear the chosen default (with one person, they stay the default)")
+    .action(async (entityId: string | undefined, opts: { clear?: boolean }) => {
+      const registry = await import("@openrig/daemon/gateway-human-registry");
+      if (entityId || opts.clear) {
+        if (entityId && opts.clear) { console.error("refused: pass an id or --clear, not both"); process.exitCode = 1; return; }
+        const res = registry.setDefaultPerson(opts.clear ? null : entityId!);
+        if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
+      }
+      const people = registry.projectHumans();
+      if (!people.ok) { console.error(`refused: ${people.error}`); process.exitCode = 1; return; }
+      const chosen = registry.resolveDefaultPerson(people.entities);
+      console.log(JSON.stringify(chosen.person
+        ? { ok: true, default: chosen.person.entityId, address: chosen.person.address, source: chosen.source }
+        : { ok: true, default: null, reason: chosen.source === "none" ? chosen.reason : null }));
     });
 
   return cmd;
@@ -622,4 +790,27 @@ function describeApplication(a: Record<string, any>): string {
     : `${a.modeName} on since ${a.startedAt}${a.scheduledEnd ? `, until ${a.scheduledEnd}` : ""}`;
   const effects = (a.effects as Array<Record<string, any>>).map((e) => `  ${e.consumer}: ${e.state}${e.detail ? ` (${e.detail})` : ""}`);
   return [head, ...(effects.length ? effects : ["  no effects"])].join("\n");
+}
+
+/** --policy or --policy-file (never both): the readable policy text agents read. Absent is undefined. */
+function readPolicyOption(opts: { policy?: string; policyFile?: string }): { ok: true; value: string | undefined } | { ok: false; error: string } {
+  if (opts.policy !== undefined && opts.policyFile !== undefined) return { ok: false, error: "pass --policy or --policy-file, not both" };
+  if (opts.policyFile === undefined) return { ok: true, value: opts.policy };
+  try {
+    return { ok: true, value: readFileSync(opts.policyFile, "utf8") };
+  } catch (error) {
+    return { ok: false, error: `--policy-file: ${(error as Error).message}` };
+  }
+}
+
+/** One participant's organization, groups, default and policy, in plain lines. */
+function describePlacement(p: { organization: { id: string; name: string } | null; groups: Array<{ id: string; name: string }>; default: boolean; policy: Array<{ source: string; text: string }> }): string[] {
+  const lines = [
+    `  organization: ${p.organization ? `${p.organization.id} (${p.organization.name})` : "none"}`,
+    `  groups: ${p.groups.length ? p.groups.map((g) => `${g.id} (${g.name})`).join(", ") : "none"}`,
+  ];
+  if (p.default) lines.push("  default: yes (escalations, the notice digest and other unaddressed needs go to this person)");
+  if (!p.policy.length) lines.push("  policy: none");
+  for (const part of p.policy) lines.push(`  policy, from ${part.source}:`, ...part.text.trimEnd().split("\n").map((line) => `    ${line}`));
+  return lines;
 }

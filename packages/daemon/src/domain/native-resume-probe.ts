@@ -91,10 +91,11 @@ export function buildCodexResumeCore(
   // resume subcommand.
   const modelArg = model ? ` -m ${shellQuote(model)}` : "";
   const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
-  const middle = extraArgs ? `${extraArgs} ` : "";
+  // Keep the identity before paths: process listings join argv without shell quoting.
+  const suffix = extraArgs ? ` ${extraArgs}` : "";
   const tokenArg = useLast ? "--last" : shellQuote(resumeToken);
   const daemonArg = daemonOptOut ? " --no-daemon" : "";
-  return `codex${daemonArg}${profileOrPosture}${modelArg}${effortArg} resume ${middle}${tokenArg}`;
+  return `codex${daemonArg}${profileOrPosture}${modelArg}${effortArg} resume ${tokenArg}${suffix}`;
 }
 
 export function assessNativeResumeProbe(
@@ -191,6 +192,24 @@ export function assessNativeResumeProbe(
   }
 
   if (runtime === "codex") {
+    if (looksLikeCodexLoginPrompt(paneContent)) {
+      // A wrapper must be verified and resampled before old chrome can prove readiness or drive a menu.
+      if (paneCommand !== "codex" && input.codexProcessVerified !== true) {
+        const shell = SHELL_COMMANDS.has(paneCommand);
+        return {
+          status: shell ? "failed" : "inconclusive",
+          code: shell ? "returned_to_shell" : "awaiting_runtime",
+          detail: shell
+            ? "The probe pane returned to a shell instead of staying inside the runtime."
+            : "Codex did not report an explicit failure, but an interactive conversation has not been observed.",
+        };
+      }
+      return {
+        status: "attention_required",
+        code: "login_required",
+        detail: "Codex is waiting for you to sign in or configure provider credentials before the session can become interactive.",
+      };
+    }
     if (/requires a newer version of Codex/i.test(paneContent.replace(/\s+/g, " "))) {
       return {
         status: "attention_required", code: "codex_client_incompatible",
@@ -320,34 +339,84 @@ function looksLikeClaudeTrustPrompt(paneContent: string): boolean {
 // operator choose; later reconciliation upgrades to `operator_recovered` only
 // when the operator reaches a usable state.
 function looksLikeClaudeResumeSelectionPrompt(paneContent: string): boolean {
+  if (currentClaudeResumePicker(paneContent)) return true;
   // Current Claude chooser (observed 2026-09-04) asks which fidelity to
-  // resume with. Require the heading, both option rows, and a selection cursor;
-  // prose containing the labels is intentionally insufficient.
-  const recentLines = paneContent.split("\n").slice(-30);
-  const currentChooserHeading = recentLines.some((line) => line.trim() === "How would you like to resume?");
-  const currentChooserOptions = recentLines.filter((line) =>
-    /^\s*(?:[❯›]\s+)?(?:Resume from summary|Resume full session as-is)\s*$/.test(line)
-  );
-  const currentChooserSelection = currentChooserOptions.some((line) => /^\s*[❯›]\s+/.test(line));
-  if (
-    currentChooserHeading
-    && currentChooserSelection
-    && currentChooserOptions.some((line) => line.includes("Resume from summary"))
-    && currentChooserOptions.some((line) => line.includes("Resume full session as-is"))
-  ) return true;
+  // resume with. Require the heading, both option rows after it, and a selection cursor;
+  // prose containing the labels is intentionally insufficient. A chooser drawn
+  // at the top of a tall pane sits above blank rows, so count from the last drawn row.
+  // A chooser counts only while it is the last thing drawn: a composer, header or reply
+  // after its options means it is history above a session that resumed.
+  const drawn = paneContent.trimEnd().split("\n");
+  const recentLines = drawn.slice(-30);
+  const heading = recentLines.map((line) => line.trim() === "How would you like to resume?").lastIndexOf(true);
+  if (heading >= 0) {
+    const after = recentLines.slice(heading + 1);
+    const options = after.map((line) => /^\s*(?:[❯›]\s+)?(?:Resume from summary|Resume full session as-is)\s*$/.test(line));
+    const chosen = (test: (line: string) => boolean) => after.some((line, at) => options[at] && test(line));
+    if (
+      chosen((line) => /^\s*[❯›]\s+/.test(line))
+      && chosen((line) => line.includes("Resume from summary"))
+      && chosen((line) => line.includes("Resume full session as-is"))
+      && !claudeDrawnAfter(after.slice(options.lastIndexOf(true) + 1))
+    ) return true;
+  }
 
   // Stable substring is the explicit "Choose ... conversation" verb plus the
-  // numbered/arrow option marker that Claude prints. Both must be present so
-  // we don't false-positive on similar TUI strings.
-  const hasChooseVerb =
-    paneContent.includes("Choose a conversation")
-    || paneContent.includes("Choose the conversation")
-    || paneContent.includes("Select a conversation");
-  if (!hasChooseVerb) return false;
+  // numbered/arrow option marker that Claude prints after it. A long list can push the
+  // heading above the window, so it's read from the whole capture; the last option must be
+  // in the window, and nothing of Claude's own may be drawn after it.
+  const verb = drawn.map((line) => /Choose (?:a|the) conversation|Select a conversation/.test(line)).lastIndexOf(true);
+  if (verb < 0) return false;
+  const recentStart = Math.max(verb + 1, drawn.length - 30);
+  const lastOption = drawn.map((line, at) => at >= recentStart && /^\s*(?:[›»]\s*)?\d+\.\s+\S/.test(line)).lastIndexOf(true);
+  // A draft's own numbered rows can read as the last options, so the input frame counts anywhere after the heading.
+  return lastOption >= 0 && !claudeDrawnAfter(drawn.slice(lastOption + 1)) && !hasClaudeInputFrame(drawn.slice(verb + 1));
+}
 
-  // Look for the numbered/arrow option marker in recent lines.
-  const numberedOption = recentLines.some((line) => /^\s*(?:[›»]\s*)?\d+\.\s+\S/.test(line));
-  return numberedOption;
+/** Claude Code's "Resume session" picker (2.1.309), drawn when `claude --resume` has no exact session to open: a bare
+ *  `--resume`, or a name that matches no session title or several. Its heading row (an optional detail follows, such as
+ *  " (2 of 9)"), then its search box directly under it: `╭─…─╮`, a `│ ⌕` row, any rows a long query wraps to, `╰─…─╯`.
+ *  The cards, the query and the hint row vary with the mode (a list, a search with no match, rename), so none of them
+ *  is required. A paste or typed text goes into its search, and Enter resumes the focused card. The last picker drawn
+ *  counts until Claude's framed input box or a reply (a column-0 ● or ⏺ row) follows its box, which makes it history.
+ *  Claude's header text doesn't count here: a card's title can say "Claude Code v2.1.309" too, and a resumed session
+ *  draws its input box. Returns the heading row, or null. */
+export function currentClaudeResumePicker(paneContent: string): string | null {
+  const rows = paneContent.trimEnd().split(/\r?\n/);
+  for (let at = rows.length - 1; at >= 0; at--) {
+    if (!/^\s*Resume session\b/.test(rows[at]!)) continue;
+    const boxEnd = claudeSearchBoxEnd(rows, at + 1);
+    if (boxEnd < 0) continue;
+    const later = rows.slice(boxEnd + 1);
+    return hasClaudeInputFrame(later) || later.some((line) => /^[●⏺]/.test(line)) ? null : rows[at]!.trim();
+  }
+  return null;
+}
+
+function claudeSearchBoxEnd(rows: string[], top: number): number {
+  if (!/^\s*╭─+╮\s*$/.test(rows[top] ?? "") || !/^\s*│\s*⌕/.test(rows[top + 1] ?? "")) return -1;
+  for (let at = top + 2; at < rows.length; at++) {
+    if (/^\s*╰─+╯\s*$/.test(rows[at]!)) return at;
+    if (!/^\s*│.*│\s*$/.test(rows[at]!)) return -1;
+  }
+  return -1;
+}
+
+/** Claude's own UI drawn after a chooser's options: its framed input box, its version header or a reply. A bare ❯ row
+ *  doesn't count: it can sit under a live chooser, and a missed chooser reads resumed. Hint rows and blank rows under the
+ *  options belong to the chooser. */
+function claudeDrawnAfter(rows: string[]): boolean {
+  return hasClaudeInputFrame(rows) || rows.some((line) => line.includes("Claude Code v") || /^[●⏺]/.test(line));
+}
+
+// On a named session Claude labels the frame's top rule (`─────…── probe-claude@rig ─`), so a rule may carry text after a space.
+const CLAUDE_INPUT_RULE = /^\s*─{3,}(?:\s.*)?$/;
+
+/** Claude's input frame: a rule, the ❯ row directly under it, and another rule below. A composer holding a draft that
+ *  starts with "1." looks like a numbered option row; the frame is what tells them apart. */
+function hasClaudeInputFrame(rows: string[]): boolean {
+  return rows.some((line, at) => CLAUDE_INPUT_RULE.test(line) && /^\s*❯/.test(rows[at + 1] ?? "")
+    && rows.slice(at + 2).some((row) => CLAUDE_INPUT_RULE.test(row)));
 }
 
 // Claude's interactive refusals of a request for a missing, expired or revoked login (code.claude.com/docs/en/errors).
@@ -453,6 +522,50 @@ function looksLikeCodexAuthRefusal(paneContent: string): boolean {
   );
 }
 
+function looksLikeCodexLoginPrompt(paneContent: string): boolean {
+  const lines = paneContent.trimEnd().split(/\r?\n/);
+  let welcome = -1;
+  let fence = "";
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const marker = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (!fence) fence = marker[1]!;
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = "";
+      welcome = -1;
+    } else if (!fence && line === "  Welcome to Codex, OpenAI's command-line coding agent") {
+      welcome = index;
+    }
+  }
+  if (welcome < 0) return false;
+  const current = lines.slice(welcome + 1);
+  if (hasCodexComposer(current.join("\n"))) return false;
+  const panel = current.map(line => line.trim()).filter(Boolean);
+
+  // Read the current complete panel only: a later prompt or menu must not lend an old login picker its footer.
+  const legacyChooser = panel[0] === "Sign in with ChatGPT to use Codex as part of your paid plan"
+    && panel[1] === "or connect an API key for usage-based billing";
+  if ((panel[0] === "Choose how you want to use Codex." || legacyChooser)
+    && panel.indexOf("Press enter to continue") === panel.length - 1) {
+    const choices = panel.flatMap(line => {
+      const choice = /^(> )?(\d+)\. (.+)$/.exec(line);
+      return choice ? [{ selected: !!choice[1], number: Number(choice[2]), label: choice[3] }] : [];
+    });
+    const labels = legacyChooser
+      ? ["Sign in with ChatGPT", "Sign in with Device Code", "Provide your own API key"]
+      : ["Sign in with ChatGPT", "Sign in with Device Code", "Use an OpenAI API key", "Use Amazon Bedrock"];
+    return choices.length >= 2 && (!legacyChooser || choices.length === labels.length)
+      && choices.filter(choice => choice.selected).length === 1
+      && choices.every((choice, index) => choice.number === index + 1
+        && (legacyChooser ? choice.label === labels[index] : labels.includes(choice.label!)));
+  }
+  return panel[0] === "> Use your own OpenAI API key for usage-based billing"
+    && panel.includes("Paste or type your API key below.")
+    && panel.some(line => /^╭API key─+╮$/.test(line))
+    && panel.indexOf("Press enter to save") === panel.length - 2
+    && panel.at(-1) === "Press esc to go back";
+}
+
 function looksLikeCodexTrustPrompt(paneContent: string): boolean {
   // Preserve legacy wording semantics, including scrollback matching.
   return paneContent.includes("Do you trust the contents of this directory?")
@@ -518,11 +631,12 @@ function looksLikeCodexHookReviewPrompt(paneContent: string): boolean {
 }
 
 function looksLikeCodexModelSelectionPrompt(paneContent: string): boolean {
-  const recentLines = paneContent.split("\n").slice(-20);
-  const numberedModelOptions = recentLines.filter((line) => (
-    /^\s*(?:[›»]\s*)?\d+\.\s+/.test(line)
-    && /\bgpt-[\w.-]+\b/i.test(line)
-  ));
-
-  return numberedModelOptions.length >= 2;
+  // A chooser drawn at the top of a tall pane sits above blank rows, so count from the last drawn row.
+  const recentLines = paneContent.trimEnd().split("\n").slice(-20);
+  const options = recentLines.map((line) => /^\s*(?:[›»]\s*)?\d+\.\s+/.test(line) && /\bgpt-[\w.-]+\b/i.test(line));
+  if (options.filter(Boolean).length < 2) return false;
+  // The options count only while they are the last thing drawn: a composer or a Codex header after
+  // them means they are history above a session that resumed. The status footer belongs to the chooser.
+  return !recentLines.slice(options.lastIndexOf(true) + 1)
+    .some((line) => line.includes("OpenAI Codex (v") || hasCodexComposer(line));
 }

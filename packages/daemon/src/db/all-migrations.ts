@@ -5,6 +5,8 @@ import { claudeTokenReadingsSchema } from "./migrations/134_claude_token_reading
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
 
+import { nodeClaudePermissionsSchema } from "./migrations/139_node_claude_permissions.js";
+import { nodeCodexPermissionsSchema } from "./migrations/137_node_codex_permissions.js";
 import { coreSchema } from "./migrations/001_core_schema.js";
 import { terminalPolicySchema } from "./migrations/128_terminal_policy.js";
 import { streamDispositionsSchema } from "./migrations/129_stream_dispositions.js";
@@ -13,6 +15,7 @@ import { streamRetentionFloorSchema } from "./migrations/131_stream_retention_fl
 import { seatRuntimeSwitchesSchema } from "./migrations/132_seat_runtime_switches.js";
 import { streamReaderActionsSchema } from "./migrations/133_stream_reader_actions.js";
 import { seatIdentityProcessEvidenceSchema } from "./migrations/135_seat_identity_process_evidence.js";
+import { nodeClaudeTokenRefSchema } from "./migrations/138_node_claude_token_ref.js";
 import { bindingsSessionsSchema } from "./migrations/002_bindings_sessions.js";
 import { eventsSchema } from "./migrations/003_events.js";
 import { snapshotsSchema } from "./migrations/004_snapshots.js";
@@ -126,6 +129,7 @@ import { queueTransitionsTsQitemSchema } from "./migrations/112_queue_transition
 import { appliedLaunchDaemonOptOutSchema } from "./migrations/113_applied_launch_daemon_opt_out.js";
 import { sessionAgentAppSchema as sessionCommunityHarnessSchema } from "./migrations/114_session_agent_app.js";
 import { threadSeatMapChannelKeySchema } from "./migrations/115_thread_seat_map_channel_key.js";
+import { nodeLaunchRecipeSchema } from "./migrations/136_node_launch_recipe.js";
 import { queueItemWakeInputBoxSchema } from "./migrations/116_queue_item_wake_input_box.js";
 import { providerAccountReadingsSchema } from "./migrations/117_provider_account_readings.js";
 import { humanQuietWindowsSchema } from "./migrations/118_human_quiet_windows.js";
@@ -271,4 +275,8 @@ export const ALL_MIGRATIONS: Migration[] = [
   streamReaderActionsSchema,
   claudeTokenReadingsSchema,
   seatIdentityProcessEvidenceSchema,
+  nodeLaunchRecipeSchema,
+  nodeClaudeTokenRefSchema,
+  nodeClaudePermissionsSchema,
+  nodeCodexPermissionsSchema,
 ];

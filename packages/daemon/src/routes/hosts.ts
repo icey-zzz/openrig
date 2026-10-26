@@ -47,6 +47,7 @@ import type { SettingsStore } from "../domain/user-settings/settings-store.js";
 import type { QueueRepository } from "../domain/queue-repository.js";
 import { existsSync } from "node:fs";
 import { loadHumanRegistry, type LoadResult } from "../domain/gateway/human-registry.js";
+import { resolveDefaultPerson } from "../domain/gateway/participants.js";
 
 const PAIR_TTL_MS = 10 * 60 * 1000;
 const PAIR_PRUNE_GRACE_MS = 60 * 60 * 1000;
@@ -163,10 +164,12 @@ export function hostsRoutes(opts?: { bearerToken?: string | null; humanRegistry?
     const body = (await c.req.json<{ requester?: string; human?: string }>().catch(() => ({}))) as { requester?: string; human?: string };
     const registry = (opts?.humanRegistry ?? loadHumanRegistry)();
     if (!registry.ok) return c.json({ error: "pair_human_registry_unavailable", message: registry.error }, 409);
-    const humans = body.human ? registry.entities.filter((human) => human.address === body.human) : registry.entities;
+    // Named, or else the default person (chosen, or the only one); never the first of several.
+    const fallback = body.human ? null : resolveDefaultPerson(registry.entities).person;
+    const humans = body.human ? registry.entities.filter((human) => human.address === body.human) : fallback ? [fallback] : [];
     if (humans.length !== 1) return c.json({
       error: "pair_human_required", addresses: registry.entities.map((human) => human.address),
-      message: "Pair approval needs one registered human. Inspect rig gateway human list --json; select --human <entityId>@external when several exist. No approval row was created.",
+      message: "Pair approval needs one registered human, or a default when several exist. Inspect rig gateway participants --json; select --human <entityId>@external, or choose a default with rig gateway default <id>. No approval row was created.",
     }, 409);
 
     // Prune stale issued pairs past the grace window (keep recently expired entries

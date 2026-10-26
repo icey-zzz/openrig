@@ -238,7 +238,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send).toHaveBeenLastCalledWith(
       "claude-seat@rig",
       expect.stringContaining("OpenRig post-compaction turn boundary"),
-      { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) },
+      { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) },
     );
 
     const belowRestore = await enforcer.maybeAutoCompact({
@@ -495,9 +495,11 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send.mock.calls[queuedSends + 1]?.[1]).toContain("restoring this Claude session after compaction");
     expect(await drainTick(enforcer)).toEqual({ triggered: true });
     expect(send.mock.calls[queuedSends + 2]?.[1]).toContain("Now audit your compaction restore");
-    // Without a sample, every stage's send must read the pane: no hook may stand in for it.
+    // Without a sample, every stage's send must read the pane: no hook may stand in for it. Only the turn boundary, the first
+    // step after /compact, reads past the compaction output above the input box.
     for (let i = 0; i < 3; i++) {
-      expect(send.mock.calls[queuedSends + i]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, beforeWrite: expect.any(Function) });
+      expect(send.mock.calls[queuedSends + i]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true,
+        beforeWrite: expect.any(Function), ...(i === 0 ? { postCompactTurnBoundary: true } : {}) });
     }
 
     expect(enforcer.hasPendingPostCompactStage("claude-seat@rig")).toBe(false);
@@ -508,7 +510,8 @@ describe("ClaudeCompactionEnforcer", () => {
   it("the sampled drain keeps ordinary send readiness", async () => {
     const { enforcer, send, queuedSends } = await queueStageWithGen("gen-uuid-1");
     expect(await belowTick(enforcer)).toEqual({ triggered: true });
-    expect(send.mock.calls[queuedSends]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
+    // Not pane-only; the first stage is the turn boundary, which also reads past the compaction output.
+    expect(send.mock.calls[queuedSends]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
   });
 
   it("the restore prompt tells a seat that did not compact to say so and skip the restore reading", () => {
@@ -1136,7 +1139,7 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
 
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
@@ -1225,7 +1228,8 @@ describe("ClaudeCompactionEnforcer", () => {
       it("after the sequence completes (audit-sent) OR fails (skipped-or-failed), a fresh re-trigger is allowed", async () => {
         const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
         const { transport, send } = makeSessionTransport();
-        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME });
+        // This checks sequence/re-trigger behavior, not elapsed preparation time; CI work must not consume its 50ms budget.
+        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME, now: () => 1_700_000_000_000 });
 
         // Drive one full sequence to audit-sent (the back-half clears the pending maps).
         await enforcer.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/c.jsonl" });
@@ -1241,8 +1245,8 @@ describe("ClaudeCompactionEnforcer", () => {
 
         // And after a FAILED trigger (prep send fails → skipped-or-failed), a retry is allowed too.
         const { transport: t2, send: send2 } = makeSessionTransport();
-        send2.mockImplementationOnce(async () => ({ ok: false, reason: "send_failed" }));
-        const enf2 = new ClaudeCompactionEnforcer(settings, t2, { openrigHome: HOME });
+        send2.mockImplementationOnce(async () => ({ ok: false, reason: "send_failed", inputPhase: "not_reached" }));
+        const enf2 = new ClaudeCompactionEnforcer(settings, t2, { openrigHome: HOME, now: () => 1_700_000_000_000 });
         expect((await enf2.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20 })).triggered).toBe(false);
         expect(enf2.getManualCompactionState(SEAT)?.stage).toBe("skipped-or-failed");
         // Retry proceeds (not blocked by the guard).
@@ -1268,7 +1272,7 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
@@ -1419,7 +1423,7 @@ describe("ClaudeCompactionEnforcer", () => {
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 95,
       })).toEqual({ triggered: true }); // owed turn boundary, not another prep
       expect(send).toHaveBeenCalledTimes(3);
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, beforeWrite: expect.any(Function) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true }); // restore

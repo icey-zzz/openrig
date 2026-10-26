@@ -1,4 +1,5 @@
 import { getNodeInventory } from "../src/domain/node-inventory.js";
+import { TerminalAdapter } from "../src/adapters/terminal-adapter.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -121,6 +122,11 @@ describe("RestoreOrchestrator", () => {
     pi?: PiResumeAdapter;
     omp?: OmpResumeAdapter;
     listProcesses?: () => Promise<Array<{ pid: number; ppid: number; command: string }>>;
+    freshLaunch?: (rigId: string, nodeId: string) => Promise<{
+      status: "launched" | "failed" | "attention_required";
+      error?: string;
+      warnings?: string[];
+    }>;
   }) {
     const tmux = opts?.tmux ?? mockTmux();
     const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
@@ -132,6 +138,7 @@ describe("RestoreOrchestrator", () => {
       piResume: opts?.pi,
       ompResume: opts?.omp,
       listProcesses: opts?.listProcesses,
+      freshLaunch: opts?.freshLaunch,
     });
   }
 
@@ -668,6 +675,19 @@ describe("RestoreOrchestrator", () => {
       "o3",
       "medium",
     );
+  });
+
+  it("attemptResume passes a Codex seat's envelope to the legacy resume, in place of kernel and team defaults", async () => {
+    const codexResume = vi.fn(async () => ({ ok: true as const }));
+    const orch = createOrchestrator({ codex: { canResume: vi.fn(() => true), resume: codexResume } as unknown as CodexResumeAdapter });
+    const rig = rigRepo.createRig("codex-envelope-test");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex", cwd: "/work" });
+    const envelope = { sandbox: "read-only", approval: "on-request" };
+    db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?").run(JSON.stringify(envelope), node.id);
+    (orch as any).claudeResume.canResume = vi.fn(() => false);
+    await (orch as any).attemptResume(node.id, "codex-session", "codex_id", "token-codex", "/work", null, "o3", "full_bypass", "medium");
+    expect(codexResume).toHaveBeenCalledWith("codex-session", "codex_id", "token-codex", "/work", null, "full_bypass", "o3",
+      "medium", undefined, undefined, undefined, undefined, envelope);
   });
 
   it("attemptResume forwards the resolved effort to the Pi resume adapter", async () => {
@@ -3105,6 +3125,88 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
+  it("rebuilds a fresh launch from a persisted recipe when startup context is absent", async () => {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-recipe", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.design", { runtime: "claude-code", podId: "pod-recipe" });
+    const session = sessionRegistry.registerSession(node.id, "dev-design@test-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const freshLaunch = vi.fn(async () => ({ status: "launched" as const }));
+    const mockAdapter = {
+      runtime: "claude-code",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness: vi.fn(async () => ({ ok: true as const })),
+    };
+    const result = await createOrchestrator({ freshLaunch }).restore(snap.id, {
+      adapters: { "claude-code": mockAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(freshLaunch).toHaveBeenCalledWith(rig.id, node.id);
+      expect(result.result.nodes[0]).toMatchObject({ nodeId: node.id, status: "fresh-primed" });
+      expect(mockAdapter.launchHarness).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps the provisional shell when retirement is not confirmed", async () => {
+    const rig = rigRepo.createRig("retire-refusal-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-retire-refusal", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.design", { runtime: "claude-code", podId: "pod-retire-refusal" });
+    const session = sessionRegistry.registerSession(node.id, "dev-design@retire-refusal-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+    const tmux = mockTmux();
+    tmux.killSession = vi.fn(async () => ({ ok: false as const, code: "guard_target_unknown", message: "pane ownership was not confirmed" }));
+    const freshLaunch = vi.fn(async () => ({ status: "launched" as const }));
+
+    const result = await createOrchestrator({ tmux, freshLaunch }).restore(snap.id, {
+      adapters: { "claude-code": { runtime: "claude-code" } as RuntimeAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.result.nodes[0]).toMatchObject({ status: "attention_required", error: expect.stringContaining("retire provisional session") });
+    expect(freshLaunch).not.toHaveBeenCalled();
+    expect(tmux.killSession).toHaveBeenCalledOnce();
+  });
+
+  it("does not restore stale prior state after a replacement session exists", async () => {
+    const rig = rigRepo.createRig("replacement-failure-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-replacement", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.design", { runtime: "claude-code", podId: "pod-replacement" });
+    const prior = sessionRegistry.registerSession(node.id, "dev-design@replacement-failure-rig");
+    sessionRegistry.updateStatus(prior.id, "running");
+    sessionRegistry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: prior.sessionName });
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(prior.id, "exited");
+    const freshLaunch = vi.fn(async () => {
+      const replacement = sessionRegistry.registerSession(node.id, "replacement@replacement-failure-rig");
+      sessionRegistry.updateStatus(replacement.id, "running");
+      return { status: "failed" as const, error: "post-launch delivery failed" };
+    });
+
+    const result = await createOrchestrator({ freshLaunch }).restore(snap.id, {
+      adapters: { "claude-code": { runtime: "claude-code" } as RuntimeAdapter },
+      freshLogicalIds: [node.logicalId],
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.result.nodes[0]).toMatchObject({ status: "failed", error: "post-launch delivery failed" });
+    expect(sessionRegistry.getSessionsForRig(rig.id).find((candidate) => candidate.sessionName === "replacement@replacement-failure-rig")?.status).toBe("running");
+    expect(db.prepare("SELECT node_id FROM bindings WHERE node_id = ?").get(node.id)).toBeUndefined();
+  });
+
   // Updated by codex-auth-refusal-attention-required slice (revision 2):
   // pod-aware nodes whose StartupOrchestrator returns
   // `startupStatus: "attention_required"` (any attention-required readiness
@@ -3281,6 +3383,41 @@ describe("RestoreOrchestrator", () => {
         expect(forecast.nodes[0]!.freshRequired).toBe(false);
       },
     );
+
+    // After an abrupt power cut, a team of one terminal came back as a working shell, yet its restore read partially_restored.
+    it("a rig whose only seat is an ordinary terminal comes back fully restored: a fresh shell is its whole restore", async () => {
+      const { snap, node } = seatSnapshot("terminal", "resume_if_possible");
+      const result = await createOrchestrator({ tmux: mockTmux() }).restore(snap.id, { adapters: { terminal: adapterFor("terminal") } });
+      if (!result.ok) throw new Error("restore failed");
+      expect(result.result.nodes.find((n) => n.nodeId === node.id)).toMatchObject({ status: "fresh-primed", noConversation: true });
+      expect(result.result.rigResult).toBe("fully_restored");
+    });
+
+    // A terminal's restore is its shell and its saved startup; when the startup didn't run, the restore wasn't whole.
+    it("a terminal outside any pod whose saved startup failed doesn't read fully restored, and keeps its shell and the warning", async () => {
+      const { snap, node } = seatSnapshot("terminal", "resume_if_possible");
+      db.prepare("UPDATE nodes SET pod_id = NULL WHERE id = ?").run(node.id);
+      const legacy = updateSnapshotData(snap, (data) => { data.nodes[0].podId = null; });
+      const tmux = mockTmux();
+      tmux.sendText = vi.fn(async () => ({ ok: false as const, code: "tmux_error", message: "fixture send failed" }));
+      const result = await createOrchestrator({ tmux }).restore(legacy.id, { adapters: { terminal: new TerminalAdapter() } });
+      if (!result.ok) throw new Error("restore failed");
+      expect(sessionRegistry.getSessionsForRig(snap.rigId).some((s) => s.nodeId === node.id && s.status === "running")).toBe(true);
+      expect(result.result.warnings.join("\n")).toContain("fixture send failed");
+      expect(getNodeInventory(db, snap.rigId).find((n) => n.nodeId === node.id)?.startupStatus).toBe("failed");
+      expect(result.result.nodes.find((n) => n.nodeId === node.id)).toMatchObject({ status: "fresh-primed" });
+      expect(result.result.nodes.find((n) => n.nodeId === node.id)?.noConversation).toBeUndefined();
+      expect(result.result.rigResult).toBe("partially_restored");
+    });
+
+    it("an agent seat started fresh still leaves the rig partially restored; only a terminal with no conversation doesn't", () => {
+      expect(rollupRestoreRigResult([{ nodeId: "a", logicalId: "a", status: "fresh-primed" }])).toBe("partially_restored");
+      expect(rollupRestoreRigResult([{ nodeId: "t", logicalId: "t", status: "fresh-primed", noConversation: true }])).toBe("fully_restored");
+      expect(rollupRestoreRigResult([
+        { nodeId: "t", logicalId: "t", status: "fresh-primed", noConversation: true },
+        { nodeId: "a", logicalId: "a", status: "awaiting-decision" },
+      ])).toBe("partially_restored");
+    });
 
     it("still stops an agent seat saved with resume_if_possible and no token", async () => {
       const { status, tmux, forecast } = await restoreSeat("claude-code", "resume_if_possible");

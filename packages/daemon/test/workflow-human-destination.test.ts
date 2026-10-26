@@ -14,6 +14,7 @@ import { PodRepository } from "../src/domain/pod-repository.js";
 import { WorkflowRuntime } from "../src/domain/workflow-runtime.js";
 import { resolveWorkflowHumanDestination } from "../src/domain/workflow-human-destination.js";
 import { addHumanFragment, writeProjection, projectionPath, type HumanFragment } from "../src/domain/gateway/human-registry.js";
+import { setDefaultPerson } from "../src/domain/gateway/participants.js";
 import { makeEnsureStuckExceptionItem } from "../src/domain/workflow-exception-escalation.js";
 import { workflowRoutes } from "../src/routes/workflow.js";
 
@@ -96,7 +97,10 @@ describe.each(["serial", "dependency"])("workflow registered-human selection at 
 
   it("an explicit existing setting selects among humans and is re-read for the next episode", () => {
     add("owner-one"); add("owner-two");
-    expect(() => resolveWorkflowHumanDestination()).toThrow(/explicitly select/);
+    expect(() => resolveWorkflowHumanDestination()).toThrow(/choose a default with rig gateway default/);
+    // The default person, chosen in the participant side file, is the fallback; the explicit setting still wins over it.
+    expect(setDefaultPerson("owner-one")).toMatchObject({ ok: true });
+    expect(resolveWorkflowHumanDestination()).toBe("owner-one@external");
     vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "owner-two@external");
     expect(resolveWorkflowHumanDestination()).toBe("owner-two@external");
     vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "owner-one@external");
