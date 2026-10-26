@@ -11,6 +11,7 @@ import { runWakeLadderTick, createWakeLadderStatus } from "../src/domain/queue-w
 import { addRigEdge, removeRigEdge } from "../src/domain/rig-edge-ops.js";
 import { RigSpecExporter } from "../src/domain/rigspec-exporter.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
+import { ViewProjector } from "../src/domain/view-projector.js";
 import { LegacyRigSpecSchema, RigSpecSchema } from "../src/domain/rigspec-schema.js";
 
 describe("same-daemon escalation routes (#605)", () => {
@@ -280,10 +281,12 @@ describe("same-daemon escalation routes (#605)", () => {
       } } : undefined };
     const result = await runWakeLadderTick(deps);
     expect(result.outcome, result.error).not.toBe("failed");
-    expect(result.actions).toContainEqual({ qitemId: created.qitemId, action: "escalate-operator" });
     const floors = () => queue.list({ limit: 100 }).filter(row =>
       row.tags?.includes("wake-escalation") && row.tags.includes(`recovery-for:${created.qitemId}`));
     expect(floors()).toHaveLength(1);
+    expect(result.actions).toContainEqual({ qitemId: path === "choice" ? floors()[0]!.qitemId : created.qitemId, action: "escalate-operator" });
+    expect(new ViewProjector(db, new EventBus(db)).show("escalations").rows.map(row => row.qitem_id))
+      .toContain(floors()[0]!.qitemId);
     expect(status.snapshot().escalationsOpen).toBeGreaterThanOrEqual(1);
     expect(posted).toEqual([]);
     expect(woken).toEqual([]);
@@ -292,6 +295,94 @@ describe("same-daemon escalation routes (#605)", () => {
     expect(floors()).toHaveLength(1);
     expect(posted).toEqual([]);
     expect(woken).toEqual([]);
+  });
+
+  it.each(["two-consumed", "shared-episode", "ordinary-posted-first", "ordinary-and-consumed", "ordinary-shared", "deferred-first", "permission-bypass", "prompt-clears", "handed-off"])("serializes choice alerts in always mode: %s", async scenario => {
+    const a = seat("a", "top.lead", "lead@a");
+    const next = seat("next", "top.lead", "lead@next");
+    rigs.addEdge(a.rig.id, a.node.id, next.session, "escalates_to");
+    const posts: string[] = [];
+    const wakes: string[] = [];
+    const logs: string[] = [];
+    let promptState: "blocked" | "clear" = "blocked";
+    let now = new Date(Date.now() + 600_000);
+    const tick = () => runWakeLadderTick({ db, queueRepo: queue, status: createWakeLadderStatus(),
+      now, retryCap: 0, humanRung: "always", readPromptState: () => promptState, log: line => logs.push(line),
+      resolveOrchestrator: () => null,
+      attemptWake: async (_id, target) => { wakes.push(target); return "verified"; },
+      deliveryEngine: { dispatchEscalation: async row => {
+        posts.push(row.qitemId); return { decision: "post", resolved: scenario !== "deferred-first", dispatched: true };
+      } } });
+    const refusal = async (consumed: boolean, n: number) => {
+      const row = await work(a.session, scenario === "handed-off");
+      if (consumed) db.prepare("UPDATE queue_items SET tags=? WHERE qitem_id=?")
+        .run(JSON.stringify([ESCALATION_HOP_TAG]), row.qitemId);
+      const key = `${a.session}|serial#${n}`;
+      for (const note of scenario === "shared-episode" || scenario === "ordinary-shared" ? [] : [`parked-owner wake reserved: ${key}; obligations ${row.qitemId}`,
+        `parked-owner wake delivery refused: ${key}; Refused: interactive prompt (${scenario === "permission-bypass" ? "permission_prompt" : "selection_prompt"})`]) {
+        queue.update({ qitemId: row.qitemId, actorSession: "watchdog@system", transitionNote: note });
+      }
+      return row;
+    };
+    const first = await refusal(!scenario.startsWith("ordinary-"), 1);
+    if (scenario === "ordinary-posted-first") {
+      await tick();
+      expect(posts).toHaveLength(1);
+    }
+    const second = await refusal(true, 2);
+    if (scenario === "shared-episode" || scenario === "ordinary-shared") {
+      const key = `${a.session}|shared#1`;
+      for (const note of [`parked-owner wake reserved: ${key}; obligations ${first.qitemId},${second.qitemId}`,
+        `parked-owner wake delivery refused: ${key}; Refused: interactive prompt (selection_prompt)`]) {
+        queue.update({ qitemId: first.qitemId, actorSession: "watchdog@system", transitionNote: note });
+      }
+    }
+    await tick();
+    expect(logs).toEqual([]);
+    if (scenario === "permission-bypass") {
+      expect(posts).toHaveLength(2);
+      now = new Date(now.getTime() + 600_000);
+      await tick();
+      expect(posts).toHaveLength(2);
+      expect(wakes).toEqual([]);
+      return;
+    }
+    expect(posts).toHaveLength(1);
+    const posted = queue.getById(posts[0]!)!;
+    expect(posted.tags).toContain("wake-prompt-refusal");
+    expect(posted.tags).toContain("prompt-kind:choice");
+    const waiting = queue.list({ limit: 100 }).find(row => row.qitemId !== posted.qitemId
+      && row.tags?.includes("wake-escalation")
+      && queue.listTransitions(row.qitemId).some(t => t.transitionNote?.includes(`operator waiting on ${posted.qitemId}`)));
+    expect(waiting).toBeDefined();
+    expect(waiting!.state).toBe("pending");
+    expect(new ViewProjector(db, new EventBus(db)).show("escalations").rows.map(row => row.qitem_id))
+      .toEqual(expect.arrayContaining([posted.qitemId, waiting!.qitemId]));
+    if (scenario === "ordinary-and-consumed" || scenario === "ordinary-shared") expect(waiting!.tags).not.toContain(ESCALATION_HOP_TAG);
+    else expect(waiting!.tags).toContain(ESCALATION_HOP_TAG);
+    now = new Date(now.getTime() + 600_000);
+    await tick();
+    expect(posts).toHaveLength(1);
+    if (scenario === "prompt-clears") {
+      promptState = "clear";
+      await tick();
+      expect(queue.getById(posted.qitemId)!.state).toBe("done");
+      expect(queue.getById(waiting!.qitemId)!.state).toBe("done");
+      expect(posts).toHaveLength(1);
+      expect(wakes).toEqual([]);
+      return;
+    }
+    await queue.update({ qitemId: posted.qitemId, actorSession: posted.destinationSession,
+      state: "done", closureReason: "no-follow-on" });
+    now = new Date(now.getTime() + 600_000);
+    await tick();
+    expect(posts).toEqual([posted.qitemId, waiting!.qitemId]);
+    await tick();
+    expect(posts).toHaveLength(2);
+    expect(wakes).toEqual([]);
+    expect(queue.getById(first.qitemId)!.destinationSession).toBe(a.session);
+    expect(queue.getById(second.qitemId)!.destinationSession).toBe(a.session);
+    if (scenario.startsWith("ordinary-")) expect(queue.getById(first.qitemId)!.tags ?? []).not.toContain(ESCALATION_HOP_TAG);
   });
 
   it.each([false, true])("a mixed prompt refusal preserves ordinary routing with existing consumed recovery=%s", async ownedElsewhere => {

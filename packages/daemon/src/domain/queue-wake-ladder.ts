@@ -1061,6 +1061,17 @@ function postedPromptAlert(db: Database.Database, except: string): string | null
   return row?.qitem_id ?? null;
 }
 
+/** Keep both ordinary and consumed-recovery choice alerts behind the same durable gate. */
+function waitsOnPostedPromptAlert(deps: WakeLadderDeps, row: QueueItem, choiceOnly: boolean): boolean {
+  const posted = choiceOnly && deps.deliveryEngine ? postedPromptAlert(deps.db, row.qitemId) : null;
+  if (!posted) return false;
+  const waiting = `${LADDER_RUNG_PREFIX} operator waiting on ${posted}`;
+  if (!deps.queueRepo.listTransitions(row.qitemId).some(t => t.transitionNote?.startsWith(waiting))) {
+    appendMarker(deps.queueRepo, row, `${waiting} reason=one person alert at a time for seats blocked at a prompt`);
+  }
+  return true;
+}
+
 /** Positive refusals enter the existing rungs without ever retrying the blocked
  * seat. One aggregate carries the episode's obligations and notification key;
  * original work remains owned by its current recipient. */
@@ -1073,7 +1084,7 @@ async function advancePromptRefusals(
   attemptWake: (qitemId: string, target: string) => Promise<string>,
   actions: WakeLadderAction[],
 ): Promise<void> {
-  const groups = new Map<string, { keys: string[]; rows: Map<string, QueueItem>; jobs: Map<string, string>; refusedAt: string; choiceSince?: string; choice?: boolean; other?: boolean; latestChoice?: boolean }>();
+  const groups = new Map<string, { keys: string[]; rowKeys: Map<string, Set<string>>; jobKeys: Set<string>; rows: Map<string, QueueItem>; jobs: Map<string, string>; refusedAt: string; choiceSince?: string; choice?: boolean; other?: boolean; latestChoice?: boolean }>();
   const readAt = (dest: string, refusedAt: string): "blocked" | "clear" | "unknown" => {
     try { return deps.readPromptState?.(dest, refusedAt) ?? "unknown"; } catch { return "unknown"; }
   };
@@ -1116,14 +1127,13 @@ async function advancePromptRefusals(
     if (readLadder(deps.db, qitem_id).exhausted) continue;
     for (const episode of openPromptRefusals(deps.queueRepo.listTransitions(qitem_id))) {
       if (!episode.key.startsWith(`${primary.destinationSession}|`)) continue;
-      // A closed disposition for this exact episode is final, even while the
-      // original work remains open. Only a new refusal key can start again.
-      if (closedEpisode(`${PROMPT_EPISODE_TAG}${episode.key}`)) continue;
+      // Ordinary work shares an episode; consumed recoveries retain independent dispositions.
       const rows = episode.ids.map(id => readCandidate(id, primary.destinationSession)).filter((row): row is QueueItem =>
-        Boolean(row && row.destinationSession === primary.destinationSession && ["pending", "in-progress", "blocked"].includes(row.state)));
+        Boolean(row && row.destinationSession === primary.destinationSession && ["pending", "in-progress", "blocked"].includes(row.state)
+          && !closedEpisode(`${PROMPT_EPISODE_TAG}${episode.key}${hasConsumedEscalationHop(deps.db, row.qitemId) ? `|consumed:${row.qitemId}` : ""}`)));
       if (!rows.length) continue;
       let group = groups.get(primary.destinationSession);
-      if (!group) { group = { keys: [], rows: new Map(), jobs: new Map(), refusedAt: episode.refusedAt }; groups.set(primary.destinationSession, group); }
+      if (!group) { group = { keys: [], rowKeys: new Map(), jobKeys: new Set(), rows: new Map(), jobs: new Map(), refusedAt: episode.refusedAt }; groups.set(primary.destinationSession, group); }
       if (Date.parse(episode.refusedAt) > Date.parse(group.refusedAt)) group.refusedAt = episode.refusedAt;
       // The transport refused at a choice prompt, such as a usage-limit dialog, that no permission hook announces.
       const choice = episode.note.includes("(selection_prompt)");
@@ -1135,8 +1145,13 @@ async function advancePromptRefusals(
         if (readAt(primary.destinationSession, episode.refusedAt) !== "clear"
           && (!group.choiceSince || Date.parse(episode.refusedAt) < Date.parse(group.choiceSince))) group.choiceSince = episode.refusedAt;
       }
-      group.keys.push(`${PROMPT_EPISODE_TAG}${episode.key}`);
-      for (const row of rows) group.rows.set(row.qitemId, row);
+      for (const row of rows) {
+        const key = `${PROMPT_EPISODE_TAG}${episode.key}${hasConsumedEscalationHop(deps.db, row.qitemId) ? `|consumed:${row.qitemId}` : ""}`;
+        if (!group.keys.includes(key)) group.keys.push(key);
+        if (!group.rowKeys.has(row.qitemId)) group.rowKeys.set(row.qitemId, new Set());
+        group.rowKeys.get(row.qitemId)!.add(key);
+        group.rows.set(row.qitemId, row);
+      }
     }
   }
 
@@ -1156,10 +1171,11 @@ async function advancePromptRefusals(
     const tag = `${PROMPT_EPISODE_TAG}${job.key}`;
     if (closedEpisode(tag)) continue;
     let group = groups.get(job.dest);
-    if (!group) { group = { keys: [], rows: new Map(), jobs: new Map(), refusedAt: job.refusedAt }; groups.set(job.dest, group); }
+    if (!group) { group = { keys: [], rowKeys: new Map(), jobKeys: new Set(), rows: new Map(), jobs: new Map(), refusedAt: job.refusedAt }; groups.set(job.dest, group); }
     if (Date.parse(job.refusedAt) > Date.parse(group.refusedAt)) group.refusedAt = job.refusedAt;
     if (job.refusedAt === group.refusedAt) group.latestChoice = job.choice;
     group.keys.push(tag);
+    group.jobKeys.add(tag);
     group.jobs.set(job.jobId, job.registeredBy);
     if (job.choice) group.choice = true; else group.other = true;
   }
@@ -1180,8 +1196,10 @@ async function advancePromptRefusals(
   for (const { qitem_id } of aggregates) {
     const aggregate = deps.queueRepo.getById(qitem_id);
     if (!aggregate || !Array.isArray(aggregate.tags)) continue;
-    const destinationTag = aggregate.tags.find(t => typeof t === "string" && t.startsWith("prompt-destination:"));
-    const dest = destinationTag?.slice("prompt-destination:".length);
+    const destinationTag = aggregate.tags.find(t => typeof t === "string"
+      && (t.startsWith("prompt-destination:") || t.startsWith("consumed-prompt-destination:")));
+    const dest = destinationTag?.slice(destinationTag.startsWith("consumed-")
+      ? "consumed-prompt-destination:".length : "prompt-destination:".length);
     if (!dest) continue;
     // Incomplete membership is not evidence that an episode ended.
     if (unreadableDestinations.has(dest)) continue;
@@ -1234,19 +1252,42 @@ async function advancePromptRefusals(
       const member = members[i]!;
       if (!hasConsumedEscalationHop(deps.db, member.row.qitemId)) continue;
       const recovery = findQueueRecovery(deps.db, member.row.qitemId);
+      const heldRecovery = recovery ? deps.queueRepo.getById(recovery.qitemId) : null;
       if (recovery && ["pending", "in-progress", "blocked"].includes(recovery.state)
-        && deps.queueRepo.getById(recovery.qitemId)?.destinationSession !== dest) {
+        && heldRecovery?.destinationSession !== dest
+        && !heldRecovery?.tags?.includes(`consumed-hop:${member.row.qitemId}`)) {
         members.splice(i, 1);
         continue;
       }
       const view = readLadder(deps.db, member.row.qitemId, 0);
       if (!view.exhausted && (view.lastMarkerTs === null || now.getTime() - view.lastMarkerTs >= intervalS * 1000)) {
         const reason = "interactive prompt blocks recovery; escalates_to one-hop delivery already used; existing fallback retained";
-        await ensureEscalationRow(deps, dest, resolveOperatorSeat() ?? member.row.sourceSession,
-          [{ row: member.row, reason }], reason, `consumed-hop:${member.row.qitemId}`, [ESCALATION_HOP_TAG]);
+        const choiceOnly = Boolean(group.choice && !group.other);
+        const promptTags = choiceOnly ? [PROMPT_ALERT_TAG, PROMPT_CHOICE_TAG, `consumed-prompt-destination:${dest}`,
+          ...(group.rowKeys.get(member.row.qitemId) ?? [])] : [];
+        const continuation = await ensureEscalationRow(deps, dest, resolveOperatorSeat() ?? member.row.sourceSession,
+          [{ row: member.row, reason }], reason, `consumed-hop:${member.row.qitemId}`, [ESCALATION_HOP_TAG, ...promptTags]);
         if (!view.orchRung) appendMarker(deps.queueRepo, member.row, `${LADDER_RUNG_PREFIX} orchestrator self-skip reason=${reason}`);
-        if (await operatorRung(deps, member.row, reason, actions, view, Boolean(group.choice && !group.other))) {
-          appendExhausted(deps.queueRepo, member.row, "consumed escalation hop reached operator fallback");
+        // A choice alert's tags and dispatch marker must live on the same durable row the shared gate reads.
+        const operatorRow = choiceOnly ? deps.queueRepo.getById(continuation.qitemId)! : member.row;
+        if (choiceOnly) {
+          const missing = promptTags.filter(tag => !operatorRow.tags?.includes(tag));
+          if (missing.length) deps.db.prepare("UPDATE queue_items SET tags=? WHERE qitem_id=?")
+            .run(JSON.stringify([...(operatorRow.tags ?? []), ...missing]), operatorRow.qitemId);
+        }
+        if (waitsOnPostedPromptAlert(deps, operatorRow, choiceOnly)) {
+          members.splice(i, 1);
+          continue;
+        }
+        const operatorView = choiceOnly ? readLadder(deps.db, operatorRow.qitemId, 0) : view;
+        if (choiceOnly && operatorView.exhausted) {
+          members.splice(i, 1);
+          continue;
+        }
+        if (await operatorRung(deps, operatorRow, reason, actions, operatorView, choiceOnly)) {
+          // Choice custody stays on the alert until it closes; exhausting its source now would retire the alert next tick.
+          if (!choiceOnly) appendExhausted(deps.queueRepo, member.row, "consumed escalation hop reached operator fallback");
+          if (choiceOnly) appendExhausted(deps.queueRepo, operatorRow, "operator rung resolved");
         }
       }
       members.splice(i, 1);
@@ -1262,12 +1303,13 @@ async function advancePromptRefusals(
     // prompt keeps the permission-prompt route.
     const choiceOnly = Boolean(group.choice && !group.other);
     const kindTags = choiceOnly ? [PROMPT_CHOICE_TAG] : [];
+    const keys = group.keys.filter(key => group.jobKeys.has(key) || members.some(m => group.rowKeys.get(m.row.qitemId)?.has(key)));
     const aggregate = await ensureEscalationRow(deps, dest,
       toOperator ? resolveOperatorSeat() ?? members[0]?.row.sourceSession ?? [...group.jobs.values()][0]! : orch!, members, reason,
-      `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...kindTags, ...group.keys], group.jobs);
+      `prompt-destination:${dest}`, [PROMPT_ALERT_TAG, ...kindTags, ...keys], group.jobs);
     const row = deps.queueRepo.getById(aggregate.qitemId);
     if (!row) continue;
-    const addedKeys = group.keys.filter(key => !row.tags?.includes(key));
+    const addedKeys = keys.filter(key => !row.tags?.includes(key));
     // A reminder's run keeps its key while its latest refusal changes kind, so the kind is recomputed on its own too.
     const kindChanged = choiceOnly !== Boolean(row.tags?.includes(PROMPT_CHOICE_TAG));
     if (addedKeys.length || kindChanged) {
@@ -1311,14 +1353,7 @@ async function advancePromptRefusals(
     // One choice-prompt alert to a person at a time on this machine: a prompt many seats hit together, such as a shared usage
     // limit, posts once. Each other choice alert stays open, names the alert it waits on, and posts after that one retires.
     // A permission prompt, which only a person can approve, never waits behind it.
-    const posted = choiceOnly && deps.deliveryEngine ? postedPromptAlert(deps.db, row.qitemId) : null;
-    if (posted) {
-      const waiting = `${LADDER_RUNG_PREFIX} operator waiting on ${posted}`;
-      if (!deps.queueRepo.listTransitions(row.qitemId).some(t => t.transitionNote?.startsWith(waiting))) {
-        appendMarker(deps.queueRepo, row, `${waiting} reason=one person alert at a time for seats blocked at a prompt`);
-      }
-      continue;
-    }
+    if (waitsOnPostedPromptAlert(deps, row, choiceOnly)) continue;
     if (await operatorRung(deps, row, reason, actions, view, choiceOnly)) {
       const floor = deps.queueRepo.listTransitions(row.qitemId).at(-1)?.transitionNote?.includes("human rung explicit-only");
       appendExhausted(deps.queueRepo, row, floor ? PROMPT_FLOOR_EXHAUSTED : "operator rung resolved");
