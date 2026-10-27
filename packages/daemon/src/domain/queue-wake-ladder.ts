@@ -1180,6 +1180,28 @@ async function advancePromptRefusals(
     if (job.choice) group.choice = true; else group.other = true;
   }
 
+  // A recovery returned to the blocked seat inherits only its source row's episodes.
+  // Reconstruct this membership before retirement, even when the recovery has no refusal of its own.
+  for (const [dest, group] of groups) {
+    for (const row of [...group.rows.values()]) {
+      if (hasConsumedEscalationHop(deps.db, row.qitemId)) continue;
+      // The newer ordinary alert must not hide the underlying returned recovery on the next tick.
+      const recovery = findQueueRecovery(deps.db, row.qitemId, PROMPT_ALERT_TAG);
+      if (!recovery || !["pending", "in-progress", "blocked"].includes(recovery.state)) continue;
+      const held = readCandidate(recovery.qitemId, dest);
+      if (!held || held.destinationSession !== dest || held.tags?.includes(PROMPT_ALERT_TAG)) continue;
+      const suffix = hasConsumedEscalationHop(deps.db, held.qitemId) ? `|consumed:${held.qitemId}` : "";
+      for (const sourceKey of group.rowKeys.get(row.qitemId) ?? []) {
+        const key = `${sourceKey}${suffix}`;
+        if (closedEpisode(key)) continue;
+        if (!group.keys.includes(key)) group.keys.push(key);
+        if (!group.rowKeys.has(held.qitemId)) group.rowKeys.set(held.qitemId, new Set());
+        group.rowKeys.get(held.qitemId)!.add(key);
+        group.rows.set(held.qitemId, held);
+      }
+    }
+  }
+
   const promptState = (dest: string): "blocked" | "clear" | "unknown" => {
     const group = groups.get(dest);
     const state = readAt(dest, group?.refusedAt ?? now.toISOString());
@@ -1230,7 +1252,6 @@ async function advancePromptRefusals(
     // Recovery owned elsewhere already has a route. A fallback finding sent
     // into this same blocked seat does not: include it in the aggregate while
     // retaining its original body/custody, rather than treating it as delivery.
-    const selfRecoveries = new Map<string, QueueItem>();
     const ownedElsewhere = members.some(({ row }) => {
       if (hasConsumedEscalationHop(deps.db, row.qitemId)) return false;
       const recovery = findQueueRecovery(deps.db, row.qitemId);
@@ -1238,14 +1259,9 @@ async function advancePromptRefusals(
       const held = deps.queueRepo.getById(recovery.qitemId);
       if (!held) return false;
       if (held.tags?.includes(PROMPT_ALERT_TAG)) return false;
-      if (held.destinationSession !== dest) return true;
-      selfRecoveries.set(held.qitemId, held);
-      return false;
+      return held.destinationSession !== dest;
     });
     if (ownedElsewhere) continue;
-    for (const row of selfRecoveries.values()) {
-      if (!group.rows.has(row.qitemId)) members.push({ row, reason: "recovery fallback also targets the prompt-blocked seat" });
-    }
     // A consumed recovery owns its own operator continuation. It must not change
     // the route or one-hop marker of unrelated work/watchdogs at the same prompt.
     for (let i = members.length - 1; i >= 0; i--) {

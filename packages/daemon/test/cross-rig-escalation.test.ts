@@ -385,6 +385,79 @@ describe("same-daemon escalation routes (#605)", () => {
     if (scenario.startsWith("ordinary-")) expect(queue.getById(first.qitemId)!.tags ?? []).not.toContain(ESCALATION_HOP_TAG);
   });
 
+  it.each(["clear", "resolve-first", "unrelated", "own-refusal"])("keeps a consumed self-recovery alert open across blocked prompt ticks: %s", async scenario => {
+    const resolveFirst = scenario === "resolve-first";
+    const a = seat("a", "top.lead", "lead@a");
+    const original = await work(a.session);
+    const key = `${a.session}|returned#1`;
+    for (const note of [`parked-owner wake reserved: ${key}; obligations ${original.qitemId}`,
+      `parked-owner wake delivery refused: ${key}; Refused: interactive prompt (selection_prompt)`]) {
+      await queue.update({ qitemId: original.qitemId, actorSession: "watchdog@system", transitionNote: note });
+    }
+    const returned = await queue.create({ sourceSession: "watchdog@system", destinationSession: a.session,
+      body: "Recovery returned to its blocked owner", nudge: false,
+      tags: ["wake-escalation", `recovery-for:${original.qitemId}`, ESCALATION_HOP_TAG] });
+    const otherKey = `${a.session}|independent#1`;
+    if (scenario === "unrelated" || scenario === "own-refusal") {
+      const row = scenario === "unrelated" ? await work(a.session) : returned;
+      for (const note of [`parked-owner wake reserved: ${otherKey}; obligations ${row.qitemId}`,
+        `parked-owner wake delivery refused: ${otherKey}; Refused: interactive prompt (selection_prompt)`]) {
+        await queue.update({ qitemId: row.qitemId, actorSession: "watchdog@system", transitionNote: note });
+      }
+    }
+    let now = new Date(Date.now() + 600_000);
+    let promptState: "blocked" | "clear" = "blocked";
+    const posts: string[] = [];
+    const tick = () => runWakeLadderTick({ db, queueRepo: queue, status: createWakeLadderStatus(), now,
+      retryCap: 0, humanRung: "always", readPromptState: () => promptState, resolveOrchestrator: () => null,
+      log: () => {}, attemptWake: async () => { throw new Error("must not wake a blocked seat"); },
+      deliveryEngine: { dispatchEscalation: async row => {
+        posts.push(row.qitemId); return { decision: "post", resolved: true, dispatched: true };
+      } } });
+    await tick();
+    expect(posts).toHaveLength(1);
+    const continuation = queue.getById(posts[0]!)!;
+    expect(continuation.tags).toContain(`consumed-hop:${returned.qitemId}`);
+    const ordinary = queue.list({ limit: 100 }).find(row => row.tags?.includes(`prompt-destination:${a.session}`))!;
+    expect(ordinary).toBeDefined();
+    now = new Date(now.getTime() + 600_000);
+    await tick();
+    expect.soft(queue.getById(continuation.qitemId)!.state).toBe("pending");
+    expect.soft(posts).toHaveLength(1);
+    expect.soft(queue.listTransitions(continuation.qitemId).some(t => t.transitionNote?.startsWith("prompt escalation retired:"))).toBe(false);
+    expect(continuation.tags).toContain(`prompt-episode:${key}|consumed:${returned.qitemId}`);
+    expect(continuation.tags).not.toContain(`prompt-episode:${key}`);
+    if (scenario === "unrelated") {
+      expect(ordinary.tags).toContain(`prompt-episode:${otherKey}`);
+      expect(continuation.tags).not.toContain(`prompt-episode:${otherKey}|consumed:${returned.qitemId}`);
+    }
+    if (scenario === "own-refusal") expect(continuation.tags).toContain(`prompt-episode:${otherKey}|consumed:${returned.qitemId}`);
+    expect(ordinary.tags).toContain(`prompt-episode:${key}`);
+    expect(ordinary.tags).not.toContain(`prompt-episode:${key}|consumed:${returned.qitemId}`);
+    expect(new ViewProjector(db, new EventBus(db)).show("escalations").rows.map(row => row.qitem_id))
+      .toEqual(expect.arrayContaining([continuation.qitemId, ordinary.qitemId]));
+    now = new Date(now.getTime() + 600_000);
+    await tick();
+    expect(queue.getById(continuation.qitemId)!.state).toBe("pending");
+    expect(posts).toHaveLength(1);
+    if (resolveFirst) {
+      await queue.update({ qitemId: continuation.qitemId, actorSession: continuation.destinationSession,
+        state: "done", closureReason: "no-follow-on" });
+      now = new Date(now.getTime() + 600_000);
+      await tick();
+      expect(posts).toEqual([continuation.qitemId, ordinary.qitemId]);
+      now = new Date(now.getTime() + 600_000);
+      await tick();
+      expect(posts).toHaveLength(2);
+      expect(queue.list({ limit: 100 }).filter(row => row.tags?.includes(`consumed-hop:${returned.qitemId}`))).toHaveLength(1);
+    }
+    promptState = "clear";
+    await tick();
+    expect(queue.getById(continuation.qitemId)!.state).toBe("done");
+    expect(queue.getById(ordinary.qitemId)!.state).toBe("done");
+    expect(posts).toHaveLength(resolveFirst ? 2 : 1);
+  });
+
   it.each([false, true])("a mixed prompt refusal preserves ordinary routing with existing consumed recovery=%s", async ownedElsewhere => {
     const a = seat("a", "top.lead", "lead@a");
     const b = seat("b", "top.lead", "lead@b");
